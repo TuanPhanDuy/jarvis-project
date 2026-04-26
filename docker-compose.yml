@@ -1,0 +1,125 @@
+version: "3.9"
+
+# JARVIS Production Stack
+#
+# Services:
+#   jarvis-api     — FastAPI server (port 8000)
+#   jarvis-worker  — RabbitMQ task consumer
+#   rabbitmq       — Message broker (AMQP 5672, Management UI 15672)
+#   prometheus     — Metrics collection (port 9090)
+#   grafana        — Dashboards (port 3000)
+#
+# Quickstart:
+#   cp .env.example .env   # fill in ANTHROPIC_API_KEY and TAVILY_API_KEY
+#   docker compose up -d
+#   open http://localhost:8000/api/health
+#   open http://localhost:3000            # Grafana (admin/admin)
+#   open http://localhost:15672           # RabbitMQ Management (guest/guest)
+
+x-jarvis-env: &jarvis-env
+  env_file: .env
+  environment:
+    RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    JARVIS_API_HOST: "0.0.0.0"
+    JARVIS_API_PORT: "8000"
+
+services:
+  # ── JARVIS API server ────────────────────────────────────────────────────────
+  jarvis-api:
+    build: .
+    <<: *jarvis-env
+    ports:
+      - "8000:8000"
+    volumes:
+      - reports:/app/reports
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # ── JARVIS Worker (queue consumer) ───────────────────────────────────────────
+  jarvis-worker:
+    build: .
+    command: ["python", "-m", "jarvis.queue.worker"]
+    <<: *jarvis-env
+    volumes:
+      - reports:/app/reports
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── RabbitMQ ─────────────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Prometheus ────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      - jarvis-api
+    restart: unless-stopped
+
+  # ── Grafana Tempo (distributed tracing) ──────────────────────────────────────
+  tempo:
+    image: grafana/tempo:2.4.1
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    ports:
+      - "3200:3200"   # Tempo HTTP API
+      - "4317:4317"   # OTLP gRPC receiver
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    restart: unless-stopped
+
+  # ── Grafana ───────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+      - tempo
+    restart: unless-stopped
+
+volumes:
+  reports:
+  rabbitmq_data:
+  prometheus_data:
+  grafana_data:
+  tempo_data:

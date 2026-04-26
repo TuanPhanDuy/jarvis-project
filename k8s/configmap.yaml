@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jarvis-config
+  namespace: jarvis
+data:
+  JARVIS_MODEL: "claude-sonnet-4-6"
+  JARVIS_MAX_TOKENS: "8096"
+  JARVIS_MAX_SEARCH_CALLS: "20"
+  JARVIS_REPORTS_DIR: "/app/reports"
+  JARVIS_SESSION_TTL_MINUTES: "60"
+  JARVIS_API_HOST: "0.0.0.0"
+  JARVIS_API_PORT: "8000"
+  RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+  RABBITMQ_TASK_QUEUE: "jarvis.tasks"

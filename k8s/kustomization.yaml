@@ -1,0 +1,13 @@
+# Apply the full stack: kubectl apply -k k8s/
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - secrets.yaml
+  - configmap.yaml
+  - rabbitmq.yaml
+  - jarvis-api.yaml
+  - jarvis-worker.yaml
+  - prometheus.yaml
+  - grafana.yaml
+  - tempo.yaml

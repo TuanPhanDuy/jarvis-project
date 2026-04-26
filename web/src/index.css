@@ -1,0 +1,94 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+  }
+
+  body {
+    background-color: #05080f;
+    color: #e0e8ff;
+    font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #05080f;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #1a2f4a;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #00d4ff44;
+  }
+}
+
+@layer components {
+  .glow-cyan {
+    box-shadow: 0 0 12px #00d4ff33, 0 0 2px #00d4ff66;
+  }
+  .glow-cyan-text {
+    text-shadow: 0 0 8px #00d4ff88;
+  }
+  .border-glow {
+    border-color: #00d4ff44;
+    box-shadow: 0 0 8px #00d4ff22;
+  }
+  .prose-jarvis {
+    @apply text-gray-200 leading-relaxed;
+  }
+  .prose-jarvis h1, .prose-jarvis h2, .prose-jarvis h3 {
+    @apply text-cyan-300 font-semibold mt-3 mb-1;
+  }
+  .prose-jarvis code {
+    @apply bg-gray-800 text-cyan-300 px-1 py-0.5 rounded text-sm font-mono;
+  }
+  .prose-jarvis pre {
+    @apply bg-gray-900 border border-gray-700 rounded-lg p-4 overflow-x-auto my-2;
+  }
+  .prose-jarvis pre code {
+    @apply bg-transparent p-0 text-gray-200;
+  }
+  .prose-jarvis a {
+    @apply text-cyan-400 underline underline-offset-2;
+  }
+  .prose-jarvis ul, .prose-jarvis ol {
+    @apply pl-4 my-1;
+  }
+  .prose-jarvis li {
+    @apply my-0.5;
+  }
+  .prose-jarvis blockquote {
+    @apply border-l-2 border-cyan-500 pl-3 text-gray-400 italic my-2;
+  }
+  .prose-jarvis table {
+    @apply w-full border-collapse my-2;
+  }
+  .prose-jarvis th {
+    @apply bg-gray-800 text-cyan-300 text-left px-3 py-1.5 border border-gray-700;
+  }
+  .prose-jarvis td {
+    @apply px-3 py-1.5 border border-gray-800;
+  }
+}
+
+.typing-cursor::after {
+  content: '▋';
+  display: inline-block;
+  animation: blink 1s step-end infinite;
+  color: #00d4ff;
+  margin-left: 1px;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}

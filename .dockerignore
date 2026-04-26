@@ -1,0 +1,12 @@
+.env
+.venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+reports/*.md
+reports/*.json
+reports/.chroma
+.git
+*.egg-info
+dist/

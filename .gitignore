@@ -1,0 +1,54 @@
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+uv.lock
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Reports (generated output — exclude from git or keep, your choice)
+# reports/*.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+web/node_modules/
+node_modules/
+
+# Claude Code project settings (local only)
+.claude/
+
+# uv lock (regeneratable)
+uv.lock

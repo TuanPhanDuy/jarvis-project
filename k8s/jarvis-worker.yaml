@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jarvis-worker
+  namespace: jarvis
+  labels:
+    app: jarvis-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: jarvis-worker
+  template:
+    metadata:
+      labels:
+        app: jarvis-worker
+    spec:
+      containers:
+        - name: jarvis-worker
+          image: jarvis:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "jarvis.queue.worker"]
+          envFrom:
+            - configMapRef:
+                name: jarvis-config
+            - secretRef:
+                name: jarvis-secrets
+          volumeMounts:
+            - name: reports
+              mountPath: /app/reports
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      volumes:
+        - name: reports
+          persistentVolumeClaim:
+            claimName: reports-pvc

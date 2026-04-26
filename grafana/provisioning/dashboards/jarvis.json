@@ -1,0 +1,77 @@
+{
+  "title": "JARVIS Overview",
+  "uid": "jarvis-overview",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Total Requests",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "datasource": "prometheus", "expr": "sum(jarvis_requests_total)", "legendFormat": "requests" }],
+      "options": { "colorMode": "background", "graphMode": "area" }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Active WebSocket Connections",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "datasource": "prometheus", "expr": "jarvis_active_websocket_connections", "legendFormat": "connections" }],
+      "options": { "colorMode": "background" }
+    },
+    {
+      "id": 3, "type": "stat", "title": "Estimated Cost (USD)",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "datasource": "prometheus", "expr": "jarvis_cost_usd_total", "legendFormat": "USD" }],
+      "options": { "colorMode": "background", "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4 } }
+    },
+    {
+      "id": 4, "type": "stat", "title": "Total Tokens (Input)",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "datasource": "prometheus", "expr": "jarvis_tokens_total{token_type=\"input\"}", "legendFormat": "input tokens" }],
+      "options": { "colorMode": "value" }
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Requests per Minute",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "datasource": "prometheus", "expr": "rate(jarvis_requests_total[1m]) * 60", "legendFormat": "{{mode}}" }
+      ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Request Duration (p95)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "datasource": "prometheus", "expr": "histogram_quantile(0.95, rate(jarvis_request_duration_seconds_bucket[5m]))", "legendFormat": "p95 {{mode}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 7, "type": "barchart", "title": "Tool Calls by Type",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        { "datasource": "prometheus", "expr": "sum by(tool_name)(jarvis_tool_calls_total)", "legendFormat": "{{tool_name}}" }
+      ]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Token Usage Over Time",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        { "datasource": "prometheus", "expr": "rate(jarvis_tokens_total[5m]) * 300", "legendFormat": "{{token_type}}" }
+      ]
+    },
+    {
+      "id": 9, "type": "stat", "title": "Queue Tasks Processed",
+      "gridPos": { "x": 0, "y": 20, "w": 6, "h": 4 },
+      "targets": [{ "datasource": "prometheus", "expr": "sum(jarvis_queue_tasks_processed_total)", "legendFormat": "processed" }],
+      "options": { "colorMode": "background" }
+    },
+    {
+      "id": 10, "type": "stat", "title": "Queue Errors",
+      "gridPos": { "x": 6, "y": 20, "w": 6, "h": 4 },
+      "targets": [{ "datasource": "prometheus", "expr": "jarvis_queue_tasks_processed_total{status=\"error\"}", "legendFormat": "errors" }],
+      "options": { "colorMode": "background" },
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "red", "value": 1 }] } } }
+    }
+  ]
+}
