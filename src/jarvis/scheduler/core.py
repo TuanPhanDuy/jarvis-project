@@ -60,14 +60,12 @@ def _memory_consolidation_job(db_path_str: str) -> None:
         from pathlib import Path
         from jarvis.config import get_settings
         from jarvis.memory.consolidator import consolidate_user_memory, get_all_user_ids
-        import anthropic
 
         settings = get_settings()
         db_path = Path(db_path_str)
-        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         user_ids = get_all_user_ids(db_path)
         for uid in user_ids:
-            count = consolidate_user_memory(db_path, uid, client, settings.fast_model)
+            count = consolidate_user_memory(db_path, uid, settings.model)
             log.info("memory_consolidated", user_id=uid, preferences=count)
     except Exception as exc:
         log.error("memory_consolidation_failed", error=str(exc))
@@ -76,7 +74,6 @@ def _memory_consolidation_job(db_path_str: str) -> None:
 def _feedback_analyze_job(db_path_str: str, reports_dir_str: str) -> None:
     """Scheduled job: analyze feedback and tool failures, save improvement report."""
     try:
-        import anthropic
         from jarvis.config import get_settings
         from jarvis.evals.feedback_analyzer import run_analysis
 
@@ -84,8 +81,7 @@ def _feedback_analyze_job(db_path_str: str, reports_dir_str: str) -> None:
         result = run_analysis(
             db_path=Path(db_path_str),
             reports_dir=Path(reports_dir_str),
-            client=anthropic.Anthropic(api_key=settings.anthropic_api_key),
-            fast_model=settings.fast_model,
+            model=settings.model,
         )
         log.info("feedback_analyze_job_done", result=result)
     except Exception as exc:

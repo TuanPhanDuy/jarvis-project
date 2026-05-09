@@ -1,8 +1,8 @@
 """Memory consolidator — runs periodically to extract user preferences from episodes.
 
-Called by the APScheduler `memory_consolidate` job.  Sends recent conversation
-episodes to the fast model (Haiku) to extract preference signals, then writes
-them to user_preferences via preferences.upsert_preference().
+Called by the APScheduler `memory_consolidate` job. Sends recent conversation
+episodes to the local model to extract preference signals, then writes them
+to user_preferences via preferences.upsert_preference().
 """
 from __future__ import annotations
 
@@ -36,14 +36,14 @@ Conversation:
 def consolidate_user_memory(
     db_path: Path,
     user_id: str,
-    client,
-    fast_model: str,
+    model: str,
     lookback_hours: int = 24,
 ) -> int:
     """Extract preferences from recent episodes and save them.
 
     Returns the number of preferences upserted.
     """
+    import ollama
     from jarvis.memory.episodic import _get_conn as ep_conn
     from jarvis.memory.preferences import upsert_preference, save_session_summary
 
@@ -68,19 +68,21 @@ def consolidate_user_memory(
     )
 
     try:
-        response = client.messages.create(
-            model=fast_model,
-            max_tokens=1024,
-            system=[{"type": "text", "text": "Extract user preferences from conversations.", "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": _EXTRACTION_PROMPT.format(episodes=episode_text)}],
+        response = ollama.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Extract user preferences from conversations."},
+                {"role": "user", "content": _EXTRACTION_PROMPT.format(episodes=episode_text)},
+            ],
+            options={"temperature": 0.1},
         )
-        text = "".join(b.text for b in response.content if hasattr(b, "text"))
+        text = response.message.content.strip()
     except Exception as exc:
         log.error("consolidate_llm_failed", user_id=user_id, error=str(exc))
         return 0
 
     count = 0
-    for line in text.strip().splitlines():
+    for line in text.splitlines():
         parts = line.strip().split("|")
         if len(parts) == 6 and parts[0] == "PREFERENCE":
             _, category, key, value, confidence_str, source = parts
@@ -92,16 +94,15 @@ def consolidate_user_memory(
             count += 1
 
     if rows:
-        # Build a short session summary from this batch
         session_ids = list({row["session_id"] for row in rows})
         summary_prompt = f"Summarize this conversation in 2-3 sentences:\n\n{episode_text[:2000]}"
         try:
-            summ_resp = client.messages.create(
-                model=fast_model,
-                max_tokens=256,
+            summ_resp = ollama.chat(
+                model=model,
                 messages=[{"role": "user", "content": summary_prompt}],
+                options={"temperature": 0.2},
             )
-            summary = "".join(b.text for b in summ_resp.content if hasattr(b, "text")).strip()
+            summary = summ_resp.message.content.strip()
             for sid in session_ids[:5]:
                 save_session_summary(db_path, sid, user_id, summary, [])
         except Exception:

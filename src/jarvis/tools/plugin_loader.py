@@ -42,6 +42,14 @@ def load_plugins() -> tuple[list[dict], dict[str, callable]]:
                 log.warning("plugin_skipped", plugin=module_info.name, reason="missing SCHEMA or handle")
                 continue
             tool_name = module.SCHEMA["name"]
+            if tool_name in registry:
+                log.warning(
+                    "plugin_name_collision",
+                    plugin=module_info.name,
+                    tool=tool_name,
+                    reason="tool name already registered — skipping duplicate",
+                )
+                continue
             schemas.append(module.SCHEMA)
             registry[tool_name] = module.handle
             log.info("plugin_loaded", plugin=module_info.name, tool=tool_name)

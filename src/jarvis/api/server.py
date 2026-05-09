@@ -20,12 +20,10 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 import structlog
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-
-import anthropic
 
 from jarvis.api.metrics import (
     ACTIVE_WS_CONNECTIONS,
@@ -40,12 +38,14 @@ from jarvis.api.models import (
     BudgetStatusResponse,
     ChatRequest,
     ChatResponse,
+    ComponentStatus,
     FeedbackRequest,
     FeedbackStatsResponse,
     HealthResponse,
     ScheduleItem,
     ScheduleRequest,
     ScheduleResponse,
+    SessionInfo,
     TokenRequest,
     TokenResponse,
     UserCreate,
@@ -56,6 +56,7 @@ from jarvis.api.models import (
     WsDone,
     WsError,
     WsIncoming,
+    WsPing,
     WsProactive,
     WsThinking,
     WsToolCall,
@@ -64,7 +65,7 @@ from jarvis.config import get_settings
 from jarvis.agents.planner import PlannerAgent
 from jarvis.agents.researcher import ResearcherAgent
 from jarvis.agents.team_agent import TeamAgent
-from jarvis.tools.registry import build_planner_registry, build_registry, build_team_registry
+from jarvis.tools.registry import build_planner_registry, build_registry
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -97,16 +98,22 @@ app = FastAPI(
     version="0.1.0",
 )
 
+import os as _os
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_os.getenv("JARVIS_CORS_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+_require_auth = None  # set in startup; callable FastAPI dependency
+_limiter = None  # slowapi Limiter, set in startup if rate_limit_enabled
+
+
 @app.on_event("startup")
 async def startup() -> None:
+    global _require_auth
     settings = get_settings()
     _pre_index_reports(settings)
     asyncio.create_task(_evict_stale_sessions())
@@ -119,6 +126,26 @@ async def startup() -> None:
     if settings.auth_enabled:
         from jarvis.auth.core import ensure_admin_exists
         ensure_admin_exists(settings.reports_dir / "jarvis.db")
+
+    if settings.rate_limit_enabled:
+        global _limiter
+        try:
+            from slowapi import Limiter, _rate_limit_exceeded_handler
+            from slowapi.errors import RateLimitExceeded
+            from slowapi.util import get_remote_address
+            _limiter = Limiter(key_func=get_remote_address, default_limits=[settings.chat_rate_limit])
+            app.state.limiter = _limiter
+            app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+            log.info("rate_limiting_enabled", limit=settings.chat_rate_limit)
+        except ImportError:
+            log.warning("slowapi_not_installed", hint="pip install slowapi to enable rate limiting")
+
+    from jarvis.auth.core import make_auth_dependency
+    _require_auth = make_auth_dependency(
+        db_path=settings.reports_dir / "jarvis.db",
+        jwt_secret=settings.jwt_secret,
+        auth_enabled=settings.auth_enabled,
+    )
 
     if settings.proactive_enabled:
         await _start_event_bus(settings)
@@ -222,7 +249,11 @@ def _pre_index_reports(settings) -> None:
     log.info("memory_pre_indexed", reports_dir=str(reports_dir))
 
 
+_last_memory_prune: float = 0.0
+
+
 async def _evict_stale_sessions() -> None:
+    global _last_memory_prune
     settings = get_settings()
     ttl_seconds = settings.api_session_ttl_minutes * 60
     while True:
@@ -235,6 +266,25 @@ async def _evict_stale_sessions() -> None:
         if stale:
             log.info("session_eviction_complete", evicted=len(stale), remaining=len(_sessions))
 
+        # Prune old memory rows once per hour
+        if now - _last_memory_prune > 3600:
+            _last_memory_prune = now
+            db_path = settings.reports_dir / "jarvis.db"
+            retention = settings.memory_retention_days
+            try:
+                from jarvis.memory.episodic import prune_old_episodes
+                from jarvis.memory.feedback import prune_old_feedback
+                from jarvis.memory.failures import prune_old_failures
+                from jarvis.memory.preferences import prune_old_preferences
+                ep = prune_old_episodes(db_path, retention)
+                fb = prune_old_feedback(db_path, retention)
+                fa = prune_old_failures(db_path, retention)
+                pr = prune_old_preferences(db_path, retention)
+                if ep + fb + fa + pr > 0:
+                    log.info("memory_pruned", episodes=ep, feedback=fb, failures=fa, preferences=pr, retention_days=retention)
+            except Exception as exc:
+                log.warning("memory_prune_error", error=str(exc))
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -246,27 +296,14 @@ def _build_agent_for_session(
     user_id: str | None = None,
     approval_gate=None,
 ) -> PlannerAgent | ResearcherAgent | TeamAgent:
-    base_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-    if settings.routing_strategy == "always_primary":
-        client = base_client
-    else:
-        from jarvis.models.router import ModelRouter
-        client = ModelRouter(  # type: ignore[assignment]
-            primary=base_client,
-            primary_model=settings.model,
-            fast_model=settings.fast_model,
-            strategy=settings.routing_strategy,
-        )
     base_schemas, base_registry = build_registry(
-        tavily_api_key=settings.tavily_api_key,
         reports_dir=settings.reports_dir,
         allowed_commands=settings.allowed_commands,
         user_id=user_id or "anonymous",
-        anthropic_api_key=settings.anthropic_api_key,
+        vision_model=settings.vision_model,
     )
     if researcher_mode:
         return ResearcherAgent(
-            client=client,
             model=settings.model,
             max_tokens=settings.max_tokens,
             tool_schemas=base_schemas,
@@ -277,19 +314,11 @@ def _build_agent_for_session(
             approval_gate=approval_gate,
         )
     if team_mode:
-        team_schemas, team_registry = build_team_registry(
-            base_schemas=base_schemas,
-            base_registry=base_registry,
-            client=client,
-            model=settings.model,
-            max_tokens=settings.max_tokens,
-        )
         return TeamAgent(
-            client=client,
             model=settings.model,
             max_tokens=settings.max_tokens,
-            tool_schemas=team_schemas,
-            tool_registry=team_registry,
+            tool_schemas=base_schemas,
+            tool_registry=base_registry,
             role="manager",
             session_id=session_id,
             user_id=user_id,
@@ -298,7 +327,6 @@ def _build_agent_for_session(
     planner_schemas, planner_registry = build_planner_registry(
         base_schemas=base_schemas,
         base_registry=base_registry,
-        client=client,
         model=settings.model,
         max_tokens=settings.max_tokens,
         session_id=session_id,
@@ -306,7 +334,6 @@ def _build_agent_for_session(
     )
     session_count = _count_user_sessions(settings, user_id)
     return PlannerAgent(
-        client=client,
         model=settings.model,
         max_tokens=settings.max_tokens,
         tool_schemas=planner_schemas,
@@ -366,7 +393,37 @@ def _instrument_tool_dispatch(
 
 @app.get("/api/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    return HealthResponse(sessions_active=len(_sessions))
+    components: dict[str, ComponentStatus] = {}
+
+    # DB check
+    try:
+        import sqlite3
+        db_path = get_settings().reports_dir / "jarvis.db"
+        if db_path.exists():
+            conn = sqlite3.connect(str(db_path), timeout=2)
+            conn.execute("SELECT 1").fetchone()
+            conn.close()
+            components["db"] = ComponentStatus(ok=True)
+        else:
+            components["db"] = ComponentStatus(ok=True, detail="not yet created")
+    except Exception as exc:
+        components["db"] = ComponentStatus(ok=False, detail=str(exc))
+
+    # Scheduler check
+    try:
+        from jarvis.scheduler.core import get_scheduler
+        sched = get_scheduler()
+        components["scheduler"] = ComponentStatus(ok=sched is not None and sched.running)
+    except Exception as exc:
+        components["scheduler"] = ComponentStatus(ok=False, detail=str(exc))
+
+    all_ok = all(c.ok for c in components.values())
+    return HealthResponse(
+        status="ok" if all_ok else "degraded",
+        sessions_active=len(_sessions),
+        ws_connections=len(_active_websockets),
+        components=components,
+    )
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
@@ -377,13 +434,27 @@ async def metrics() -> PlainTextResponse:
     )
 
 
+def _auth_dep(request: Request):
+    if _require_auth:
+        return _require_auth(request)
+
+
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest) -> ChatResponse:
+async def chat(req: ChatRequest, _user=Depends(_auth_dep)) -> ChatResponse:
     """Synchronous single-turn chat. Blocks until JARVIS replies."""
+    from jarvis.api.budget import BudgetExceededError, check_budget
+
     session_id = req.session_id or str(uuid.uuid4())
-    session = _get_session(session_id, req.researcher_mode)
+    session = _get_session(session_id, req.researcher_mode, team_mode=req.team_mode)
     agent = session["agent"]
     messages = session["messages"]
+
+    db_path = get_settings().reports_dir / "jarvis.db"
+    user_id = session.get("user_id") or "anonymous"
+    try:
+        check_budget(db_path, user_id)
+    except BudgetExceededError as exc:
+        raise HTTPException(status_code=402, detail=str(exc))
 
     _instrument_tool_dispatch(agent)
 
@@ -400,7 +471,11 @@ async def chat(req: ChatRequest) -> ChatResponse:
         except Exception as exc:
             result_holder.append(("err", str(exc), messages))
 
-    await loop.run_in_executor(_executor, run)
+    _timeout = get_settings().agent_turn_timeout_seconds
+    try:
+        await asyncio.wait_for(loop.run_in_executor(_executor, run), timeout=_timeout)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"Agent turn timed out after {_timeout}s")
 
     duration = time.perf_counter() - t0
     status, text_or_err, updated_messages = result_holder[0]
@@ -467,6 +542,17 @@ async def websocket_chat(websocket: WebSocket, session_id: str) -> None:
         session_id=session_id,
     )
 
+    _heartbeat_interval = get_settings().ws_heartbeat_seconds
+
+    async def _heartbeat() -> None:
+        while True:
+            await asyncio.sleep(_heartbeat_interval)
+            try:
+                await websocket.send_json(WsPing().model_dump())
+            except Exception:
+                break
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
     try:
         while True:
             raw = await websocket.receive_json()
@@ -495,6 +581,17 @@ async def websocket_chat(websocket: WebSocket, session_id: str) -> None:
                 team_mode=req.team_mode,
                 approval_gate=approval_gate,
             )
+
+            # Enforce monthly budget before running a turn
+            from jarvis.api.budget import BudgetExceededError, check_budget as _check_budget
+            _db_path = get_settings().reports_dir / "jarvis.db"
+            _user_id = session.get("user_id") or "anonymous"
+            try:
+                _check_budget(_db_path, _user_id)
+            except BudgetExceededError as _exc:
+                await websocket.send_json(WsError(message=str(_exc)).model_dump())
+                continue
+
             agent = session["agent"]
             # Keep approval gate in sync in case session was pre-existing
             agent._approval_gate = approval_gate
@@ -534,9 +631,19 @@ async def websocket_chat(websocket: WebSocket, session_id: str) -> None:
             await websocket.send_json(WsThinking().model_dump())
             _executor.submit(run_turn)
 
-            # Drain chunks until sentinel
+            # Drain chunks until sentinel (with agent turn timeout)
+            _ws_timeout = get_settings().agent_turn_timeout_seconds
+            _deadline = asyncio.get_event_loop().time() + _ws_timeout
             while True:
-                msg = await chunk_queue.get()
+                remaining = _deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    result_holder.append(("err", f"Agent turn timed out after {_ws_timeout}s", messages))
+                    break
+                try:
+                    msg = await asyncio.wait_for(chunk_queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    result_holder.append(("err", f"Agent turn timed out after {_ws_timeout}s", messages))
+                    break
                 if msg is None:
                     break
                 await websocket.send_json(msg)
@@ -564,6 +671,7 @@ async def websocket_chat(websocket: WebSocket, session_id: str) -> None:
     except WebSocketDisconnect:
         log.info("ws_disconnected", session_id=session_id)
     finally:
+        heartbeat_task.cancel()
         _active_websockets.pop(session_id, None)
         _session_activity.pop(session_id, None)
         ACTIVE_WS_CONNECTIONS.dec()
@@ -599,7 +707,7 @@ async def submit_feedback(req: FeedbackRequest) -> dict:
     """Record user rating on a JARVIS response."""
     from jarvis.memory.feedback import log_feedback
     db_path = get_settings().reports_dir / "jarvis.db"
-    log_feedback(db_path, req.session_id, req.response_snippet, req.rating, req.comment)
+    log_feedback(db_path, req.session_id, req.response_snippet, req.rating, req.comment, rating_type=req.rating_type)
     return {"status": "recorded"}
 
 
@@ -756,11 +864,13 @@ async def get_improvement_report() -> dict:
 
 
 @app.get("/api/audit")
-async def get_audit(limit: int = 50, session_id: str | None = None) -> list[dict]:
-    """Return recent tool-call audit log entries."""
+async def get_audit(
+    limit: int = 50, offset: int = 0, session_id: str | None = None
+) -> list[dict]:
+    """Return paginated tool-call audit log entries, newest first."""
     from jarvis.security.audit import get_recent_audit
     db_path = get_settings().reports_dir / "jarvis.db"
-    return get_recent_audit(db_path, limit=limit, session_id=session_id)
+    return get_recent_audit(db_path, limit=limit, offset=offset, session_id=session_id)
 
 
 @app.get("/api/approval/pending")
@@ -770,6 +880,47 @@ async def get_pending_approvals(session_id: str) -> list[dict]:
     if not session or not session.get("approval_gate"):
         return []
     return session["approval_gate"].get_pending()
+
+
+# ── Session management endpoints ─────────────────────────────────────────────
+
+@app.get("/api/sessions", response_model=list[SessionInfo])
+async def list_sessions() -> list[SessionInfo]:
+    """List all currently active in-memory sessions."""
+    return [
+        SessionInfo(
+            session_id=sid,
+            created_at=s["created_at"],
+            message_count=len(s.get("messages", [])),
+            user_id=s.get("user_id"),
+        )
+        for sid, s in _sessions.items()
+    ]
+
+
+@app.get("/api/sessions/{session_id}", response_model=SessionInfo)
+async def get_session(session_id: str) -> SessionInfo:
+    """Return metadata for a specific session."""
+    session = _sessions.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    return SessionInfo(
+        session_id=session_id,
+        created_at=session["created_at"],
+        message_count=len(session.get("messages", [])),
+        user_id=session.get("user_id"),
+    )
+
+
+@app.delete("/api/sessions/{session_id}", status_code=204)
+async def delete_session(session_id: str) -> None:
+    """Evict a session from memory, freeing its agent and message history."""
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    del _sessions[session_id]
+    _active_websockets.pop(session_id, None)
+    _session_activity.pop(session_id, None)
+    log.info("session_deleted", session_id=session_id)
 
 
 # ── Peer coordination endpoints ───────────────────────────────────────────────
@@ -800,6 +951,159 @@ async def receive_peer_sync(request: Request) -> dict:
     except Exception as exc:
         log.error("peer_sync_receive_error", error=str(exc))
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+# ── Reports endpoints ──────────────────────────────────────────────────────────
+
+@app.get("/api/reports")
+async def list_reports(limit: int = 50, offset: int = 0) -> list[dict]:
+    """List saved research reports, newest first. Supports pagination."""
+    settings = get_settings()
+    reports_dir = settings.reports_dir
+    if not reports_dir.exists():
+        return []
+    files = sorted(reports_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    page = files[offset: offset + limit]
+    return [
+        {
+            "name": p.name,
+            "size_bytes": p.stat().st_size,
+            "modified": p.stat().st_mtime,
+        }
+        for p in page
+    ]
+
+
+@app.get("/api/reports/{filename}")
+async def get_report(filename: str) -> dict:
+    """Return the content of a single report file."""
+    settings = get_settings()
+    report_path = (settings.reports_dir / filename).resolve()
+    if not str(report_path).startswith(str(settings.reports_dir.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not report_path.exists() or not report_path.suffix == ".md":
+        raise HTTPException(status_code=404, detail="Report not found")
+    return {"name": filename, "content": report_path.read_text(encoding="utf-8")}
+
+
+# ── Voice status endpoint ──────────────────────────────────────────────────────
+
+_voice_active: bool = False
+
+
+@app.get("/api/voice/status")
+async def voice_status() -> dict:
+    """Return whether voice mode is currently active."""
+    return {"active": _voice_active}
+
+
+# ── Memory browser endpoints ───────────────────────────────────────────────────
+
+@app.get("/api/memory/episodes")
+async def get_memory_episodes(
+    session_id: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[dict]:
+    """Return paginated episodic memory entries."""
+    from jarvis.memory.episodic import _get_conn
+    db_path = get_settings().reports_dir / "jarvis.db"
+    try:
+        conn = _get_conn(db_path)
+        if session_id:
+            rows = conn.execute(
+                "SELECT session_id, user_id, role, content, timestamp FROM episodes "
+                "WHERE session_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (session_id, limit, offset),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT session_id, user_id, role, content, timestamp FROM episodes "
+                "ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/memory/graph")
+async def get_memory_graph(entity: str | None = None, limit: int = 50) -> list[dict]:
+    """Return knowledge graph entities and their relationships."""
+    db_path = get_settings().reports_dir / "jarvis.db"
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        if entity:
+            rows = conn.execute(
+                "SELECT * FROM knowledge_graph WHERE subject LIKE ? OR object LIKE ? LIMIT ?",
+                (f"%{entity}%", f"%{entity}%", limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM knowledge_graph ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Metrics summary endpoint ───────────────────────────────────────────────────
+
+@app.get("/api/metrics/summary")
+async def get_metrics_summary() -> dict:
+    """Return a JSON summary of key Prometheus counters."""
+    from prometheus_client import REGISTRY
+
+    summary: dict = {
+        "requests_total": {"http": 0, "websocket": 0},
+        "tool_calls": {},
+        "active_ws_connections": 0,
+    }
+    try:
+        for metric in REGISTRY.collect():
+            if metric.name == "jarvis_requests_total":
+                for sample in metric.samples:
+                    mode = sample.labels.get("mode", "unknown")
+                    summary["requests_total"][mode] = int(sample.value)
+            elif metric.name == "jarvis_tool_calls_total":
+                for sample in metric.samples:
+                    tool = sample.labels.get("tool_name", "unknown")
+                    summary["tool_calls"][tool] = int(sample.value)
+            elif metric.name == "jarvis_active_ws_connections":
+                for sample in metric.samples:
+                    summary["active_ws_connections"] = int(sample.value)
+    except Exception:
+        pass
+    summary["active_sessions"] = len(_sessions)
+    return summary
+
+
+# ── Autonomous events endpoint ─────────────────────────────────────────────────
+
+@app.get("/api/autonomous/events")
+async def get_autonomous_events(limit: int = 20) -> list[dict]:
+    """Return recent autonomous agent events from the database."""
+    db_path = get_settings().reports_dir / "jarvis.db"
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS autonomous_events "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, summary TEXT, timestamp REAL)"
+        )
+        rows = conn.execute(
+            "SELECT * FROM autonomous_events ORDER BY timestamp DESC LIMIT ?", (limit,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

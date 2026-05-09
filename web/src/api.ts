@@ -53,4 +53,8 @@ export const api = {
 
   // Self-improvement report
   getImprovementReport: () => json<{ content: string | null }>('/api/improvement-report'),
+
+  // Research reports
+  listReports: () => json<{ name: string; size_bytes: number; modified: number }[]>('/api/reports'),
+  getReport: (filename: string) => json<{ name: string; content: string }>(`/api/reports/${encodeURIComponent(filename)}`),
 }

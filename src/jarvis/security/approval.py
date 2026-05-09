@@ -95,7 +95,7 @@ class ApprovalGate:
         self._pending: dict[str, ApprovalRequest] = {}
 
     def requires_approval(self, tool_name: str) -> bool:
-        level = TOOL_RISK_MAP.get(tool_name, RiskLevel.LOW)
+        level = TOOL_RISK_MAP.get(tool_name, RiskLevel.MEDIUM)
         return level.value >= self._threshold.value
 
     def check_sync(self, tool_name: str, tool_input: dict) -> bool:
@@ -107,7 +107,7 @@ class ApprovalGate:
         if not self.requires_approval(tool_name):
             return True
 
-        level = TOOL_RISK_MAP.get(tool_name, RiskLevel.LOW)
+        level = TOOL_RISK_MAP.get(tool_name, RiskLevel.MEDIUM)
         description = _describe_tool_call(tool_name, tool_input)
         now = time.time()
         req = ApprovalRequest(

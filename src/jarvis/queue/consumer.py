@@ -1,13 +1,7 @@
-"""RabbitMQ task consumer — core processing logic.
-
-Processes a single QueueTask: builds an agent, runs the turn, returns QueueResult.
-Used by the worker process.
-"""
+"""RabbitMQ task consumer — core processing logic."""
 from __future__ import annotations
 
 import structlog
-
-import anthropic
 
 from jarvis.api.metrics import QUEUE_TASKS_PROCESSED, TOOL_CALLS_TOTAL, record_usage
 from jarvis.api.models import QueueResult, QueueTask, UsageSummary
@@ -20,25 +14,18 @@ log = structlog.get_logger()
 
 
 def process_task(task: QueueTask) -> QueueResult:
-    """Process a single task synchronously and return the result.
-
-    This is called from within a worker thread/process.
-    """
     log.info("task_started", task_id=task.task_id, session_id=task.session_id)
 
     try:
         settings = get_settings()
-        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         base_schemas, base_registry = build_registry(
-            tavily_api_key=settings.tavily_api_key,
             reports_dir=settings.reports_dir,
             allowed_commands=settings.allowed_commands,
-            anthropic_api_key=settings.anthropic_api_key,
+            vision_model=settings.vision_model,
         )
 
         if task.researcher_mode:
             agent: PlannerAgent | ResearcherAgent = ResearcherAgent(
-                client=client,
                 model=settings.model,
                 max_tokens=settings.max_tokens,
                 tool_schemas=base_schemas,
@@ -49,19 +36,16 @@ def process_task(task: QueueTask) -> QueueResult:
             planner_schemas, planner_registry = build_planner_registry(
                 base_schemas=base_schemas,
                 base_registry=base_registry,
-                client=client,
                 model=settings.model,
                 max_tokens=settings.max_tokens,
             )
             agent = PlannerAgent(
-                client=client,
                 model=settings.model,
                 max_tokens=settings.max_tokens,
                 tool_schemas=planner_schemas,
                 tool_registry=planner_registry,
             )
 
-        # Instrument tool calls for metrics
         original_dispatch = agent._before_dispatch
 
         def instrumented(name: str, tool_input: dict) -> None:
@@ -76,13 +60,13 @@ def process_task(task: QueueTask) -> QueueResult:
         usage = agent.get_usage_summary()
         record_usage(usage)
         QUEUE_TASKS_PROCESSED.labels(status="success").inc()
-
         log.info("task_complete", task_id=task.task_id)
+
         return QueueResult(
             task_id=task.task_id,
             session_id=task.session_id,
             response=response_text,
-            usage=UsageSummary(**usage),
+            usage=UsageSummary(**{k: usage.get(k, 0) for k in UsageSummary.__dataclass_fields__}),
         )
 
     except Exception as exc:
@@ -92,10 +76,6 @@ def process_task(task: QueueTask) -> QueueResult:
             task_id=task.task_id,
             session_id=task.session_id,
             response="",
-            usage=UsageSummary(
-                input_tokens=0, output_tokens=0,
-                cache_write_tokens=0, cache_read_tokens=0,
-                estimated_cost_usd=0.0,
-            ),
+            usage=UsageSummary(),
             error=str(exc),
         )

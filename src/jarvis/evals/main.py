@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--tags", nargs="*", metavar="TAG", help="Filter cases by tag")
     parser.add_argument("--judge", action="store_true", help="Enable Claude-as-judge scoring")
     parser.add_argument("--output", metavar="FILE", help="Save full results to JSON file")
+    parser.add_argument("--no-persist", action="store_true", help="Skip auto-saving to eval_history.jsonl")
     parser.add_argument("--analyze-feedback", action="store_true", help="Run self-improvement feedback analysis")
     args = parser.parse_args()
 
@@ -32,17 +33,15 @@ def main() -> None:
         sys.exit(1)
 
     if args.analyze_feedback:
-        import anthropic
         from jarvis.evals.feedback_analyzer import run_analysis
-        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         db_path = settings.reports_dir / "jarvis.db"
         print("Running feedback analysis…")
-        result = run_analysis(db_path, settings.reports_dir, client, settings.fast_model)
+        result = run_analysis(db_path, settings.reports_dir, model=settings.model)
         print(f"Done: {result}")
         sys.exit(0)
 
     from jarvis.evals.suite import BASELINE_SUITE, load_suite
-    from jarvis.evals.runner import run_suite, summarize
+    from jarvis.evals.runner import run_suite, summarize, persist_results
 
     cases = load_suite(Path(args.suite)) if args.suite else BASELINE_SUITE
     print(f"Running {len(cases)} eval case(s)...\n")
@@ -70,6 +69,9 @@ def main() -> None:
           f"total ${summary['total_cost_usd']:.5f}")
     if summary["avg_judge_score"]:
         print(f"  Avg judge score: {summary['avg_judge_score']}/5")
+
+    if not args.no_persist:
+        persist_results(results, summary, settings.reports_dir)
 
     if args.output:
         import dataclasses

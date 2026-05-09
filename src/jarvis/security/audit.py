@@ -78,15 +78,25 @@ def log_tool_call(
         pass
 
 
-def get_recent_audit(db_path: Path, limit: int = 50, session_id: str | None = None) -> list[dict]:
-    """Return recent audit entries as plain dicts."""
+def get_recent_audit(
+    db_path: Path,
+    limit: int = 50,
+    offset: int = 0,
+    session_id: str | None = None,
+) -> list[dict]:
+    """Return paginated audit entries as plain dicts, newest first."""
     try:
         conn = _get_conn(db_path)
-        where = "WHERE session_id = ?" if session_id else ""
-        args = (session_id, limit) if session_id else (limit,)
-        rows = conn.execute(
-            f"SELECT * FROM audit_log {where} ORDER BY timestamp DESC LIMIT ?", args
-        ).fetchall()
+        if session_id:
+            rows = conn.execute(
+                "SELECT * FROM audit_log WHERE session_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (session_id, limit, offset),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
     except Exception:

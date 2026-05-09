@@ -88,10 +88,15 @@ class TestApprovalGate:
         assert len(called) == 1
         assert called[0].tool_name == "capture_camera"
 
-    def test_unknown_tool_defaults_to_low_risk(self) -> None:
+    def test_unknown_tool_defaults_to_medium_risk(self) -> None:
         gate = ApprovalGate(threshold=RiskLevel.HIGH)
-        # Unknown tool → LOW < HIGH → no approval needed
+        # Unknown tool → MEDIUM < HIGH → no approval at HIGH threshold
         assert not gate.requires_approval("some_unknown_plugin_tool")
+
+    def test_unknown_tool_requires_approval_at_medium_threshold(self) -> None:
+        gate = ApprovalGate(threshold=RiskLevel.MEDIUM, timeout_seconds=1)
+        # Unknown tool defaults to MEDIUM → requires approval at MEDIUM threshold
+        assert gate.requires_approval("some_new_plugin_tool")
 
     def test_get_pending_returns_active_requests(self) -> None:
         gate = ApprovalGate(threshold=RiskLevel.MEDIUM, timeout_seconds=2)

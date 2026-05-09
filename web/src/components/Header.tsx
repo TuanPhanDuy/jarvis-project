@@ -1,4 +1,6 @@
-import { Wifi, WifiOff, RefreshCw, Cpu, Search, Users } from 'lucide-react'
+import { useState, useEffect } from 'react'
+import { Wifi, WifiOff, RefreshCw, Cpu, Search, Users, Mic, MicOff } from 'lucide-react'
+const API_BASE = '/api'
 
 export type AgentMode = 'planner' | 'researcher' | 'team'
 
@@ -17,6 +19,20 @@ const MODES: { id: AgentMode; label: string; icon: React.ReactNode; desc: string
 ]
 
 export function Header({ connected, sessionId, agentMode, onAgentModeChange, onNewSession }: HeaderProps) {
+  const [voiceActive, setVoiceActive] = useState(false)
+
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/voice/status`)
+        if (res.ok) setVoiceActive((await res.json()).active)
+      } catch {}
+    }
+    check()
+    const id = setInterval(check, 5000)
+    return () => clearInterval(id)
+  }, [])
+
   return (
     <header className="flex items-center justify-between px-5 py-3 border-b border-jarvis-border bg-jarvis-card/80 backdrop-blur-sm shrink-0">
       {/* Logo */}
@@ -56,6 +72,13 @@ export function Header({ connected, sessionId, agentMode, onAgentModeChange, onN
 
       {/* Right: session info */}
       <div className="flex items-center gap-3">
+        {/* Voice status indicator */}
+        <div
+          title={voiceActive ? 'Voice mode active' : 'Voice mode off'}
+          className={`flex items-center gap-1 text-xs ${voiceActive ? 'text-red-400' : 'text-gray-600'}`}
+        >
+          {voiceActive ? <Mic size={13} className="animate-pulse" /> : <MicOff size={13} />}
+        </div>
         <div className="flex items-center gap-1.5 text-xs text-gray-500">
           {connected
             ? <Wifi size={13} className="text-cyan-400" />

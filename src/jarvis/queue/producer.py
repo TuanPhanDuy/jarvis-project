@@ -23,6 +23,7 @@ def publish_task(
     researcher_mode: bool = False,
     rabbitmq_url: str = "amqp://guest:guest@localhost:5672/",
     queue_name: str = "jarvis.tasks",
+    reply_to: str | None = None,
 ) -> str:
     """Publish a task to RabbitMQ and return the task_id.
 
@@ -32,6 +33,9 @@ def publish_task(
         researcher_mode: Use ResearcherAgent instead of PlannerAgent.
         rabbitmq_url: AMQP connection URL.
         queue_name: Name of the task queue.
+        reply_to: Optional reply queue name for the AMQP RPC pattern. If set,
+            the worker will publish the result to this queue instead of the
+            shared results queue, allowing the caller to await a specific result.
 
     Returns:
         task_id — a UUID string you can use to poll for results.
@@ -55,6 +59,7 @@ def publish_task(
             properties=pika.BasicProperties(
                 delivery_mode=pika.DeliveryMode.Persistent,
                 content_type="application/json",
+                reply_to=reply_to,
             ),
         )
         QUEUE_TASKS_PUBLISHED.inc()

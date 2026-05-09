@@ -4,8 +4,6 @@ from __future__ import annotations
 import argparse
 import sys
 
-import anthropic
-
 from jarvis.config import get_settings
 from jarvis.agents.planner import PlannerAgent
 from jarvis.agents.researcher import ResearcherAgent
@@ -27,31 +25,17 @@ from jarvis.utils.console import (
 
 
 def _build_agent(settings, researcher_mode: bool = False) -> PlannerAgent | ResearcherAgent:
-    base_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-    if settings.routing_strategy == "always_primary":
-        client = base_client
-    else:
-        from jarvis.models.router import ModelRouter
-        client = ModelRouter(  # type: ignore[assignment]
-            primary=base_client,
-            primary_model=settings.model,
-            fast_model=settings.fast_model,
-            strategy=settings.routing_strategy,
-        )
     agent_ref: list = []
 
-    # Base registry — all tools except delegate_task (used by sub-agents)
     base_schemas, base_registry = build_registry(
-        tavily_api_key=settings.tavily_api_key,
         reports_dir=settings.reports_dir,
         get_messages=lambda: agent_ref[0].get_messages() if agent_ref else [],
         allowed_commands=settings.allowed_commands,
-        anthropic_api_key=settings.anthropic_api_key,
+        vision_model=settings.vision_model,
     )
 
     if researcher_mode:
         agent = ResearcherAgent(
-            client=client,
             model=settings.model,
             max_tokens=settings.max_tokens,
             tool_schemas=base_schemas,
@@ -59,16 +43,13 @@ def _build_agent(settings, researcher_mode: bool = False) -> PlannerAgent | Rese
             max_search_calls=settings.max_search_calls,
         )
     else:
-        # Planner registry adds delegate_task on top of the base tools
         planner_schemas, planner_registry = build_planner_registry(
             base_schemas=base_schemas,
             base_registry=base_registry,
-            client=client,
             model=settings.model,
             max_tokens=settings.max_tokens,
         )
         agent = PlannerAgent(
-            client=client,
             model=settings.model,
             max_tokens=settings.max_tokens,
             tool_schemas=planner_schemas,
@@ -122,18 +103,16 @@ def _run_interactive(agent: PlannerAgent | ResearcherAgent) -> None:
 
 
 def _run_voice(agent: PlannerAgent | ResearcherAgent, settings) -> None:
-    """Full hands-free voice loop: record → transcribe → agent → speak."""
     from jarvis.voice import stt, tts
 
     if not stt.is_available():
         print_error(
             "Voice mode requires openai-whisper, pyaudio, and numpy.\n"
-            "Install with: pip install openai-whisper pyaudio numpy"
+            "Install with: uv pip install openai-whisper pyaudio numpy"
         )
         return
 
     print_voice_welcome()
-
     _status_ctx: list = []
     _streaming_started: list[bool] = [False]
 
@@ -188,7 +167,6 @@ def _run_voice(agent: PlannerAgent | ResearcherAgent, settings) -> None:
 
 
 def _run_one_shot(agent: ResearcherAgent, topic: str) -> None:
-    """Research a topic non-interactively and print the result."""
     messages = [{"role": "user", "content": f"Research this topic thoroughly: {topic}"}]
     with thinking_status(f"Researching: {topic}"):
         text, _ = agent.run_turn(messages)
@@ -197,34 +175,18 @@ def _run_one_shot(agent: ResearcherAgent, topic: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="JARVIS — AI research agent powered by Claude"
+        description="JARVIS — local AI agent powered by Ollama"
     )
-    parser.add_argument(
-        "--topic",
-        metavar="TOPIC",
-        help="Research a specific topic non-interactively and exit",
-    )
-    parser.add_argument(
-        "--voice",
-        action="store_true",
-        help="Enable voice mode: speak to JARVIS and hear responses aloud",
-    )
-    parser.add_argument(
-        "--researcher",
-        action="store_true",
-        help="Use ResearcherAgent directly instead of the default PlannerAgent orchestrator",
-    )
-    parser.add_argument(
-        "--ambient",
-        action="store_true",
-        help="Run in ambient mode: wake-word activated, continuous voice loop",
-    )
+    parser.add_argument("--topic", metavar="TOPIC", help="Research a topic non-interactively and exit")
+    parser.add_argument("--voice", action="store_true", help="Enable voice mode")
+    parser.add_argument("--researcher", action="store_true", help="Use ResearcherAgent directly")
+    parser.add_argument("--ambient", action="store_true", help="Ambient wake-word voice loop")
     args = parser.parse_args()
 
     try:
         settings = get_settings()
     except Exception as e:
-        print_error(f"Configuration error: {e}\nCopy .env.example to .env and fill in your API keys.")
+        print_error(f"Configuration error: {e}")
         sys.exit(1)
 
     agent = _build_agent(settings, researcher_mode=args.researcher)
@@ -233,7 +195,6 @@ def main() -> None:
         _run_one_shot(agent, args.topic)
     elif args.ambient:
         from jarvis.voice.ambient import run_ambient_mode
-        from jarvis.voice import tts
         run_ambient_mode(agent, settings)
     elif args.voice:
         _run_voice(agent, settings)

@@ -10,6 +10,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., description="User message to send to JARVIS")
     session_id: str | None = Field(None, description="Session ID for conversation continuity")
     researcher_mode: bool = Field(False, description="Use ResearcherAgent instead of PlannerAgent")
+    team_mode: bool = Field(False, description="Use TeamAgent (multi-agent collaboration)")
 
 
 class UsageSummary(BaseModel):
@@ -91,6 +92,11 @@ class WsProactive(BaseModel):
     severity: str = "info"
 
 
+class WsPing(BaseModel):
+    """Server → client: heartbeat keep-alive ping."""
+    type: str = "ping"
+
+
 # ── Queue tasks ───────────────────────────────────────────────────────────────
 
 class QueueTask(BaseModel):
@@ -145,6 +151,7 @@ class FeedbackRequest(BaseModel):
     response_snippet: str = ""
     rating: int = Field(..., ge=-1, le=5, description="-1/+1 thumbs or 1-5 stars")
     comment: str = ""
+    rating_type: str = Field("thumbs", description="'thumbs' for -1/+1, 'stars' for 1-5")
 
 
 class FeedbackStatsResponse(BaseModel):
@@ -186,9 +193,25 @@ class TokenResponse(BaseModel):
     expires_in: int  # seconds
 
 
+# ── Sessions ──────────────────────────────────────────────────────────────────
+
+class SessionInfo(BaseModel):
+    session_id: str
+    created_at: float
+    message_count: int
+    user_id: str | None = None
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
+
+class ComponentStatus(BaseModel):
+    ok: bool
+    detail: str = ""
+
 
 class HealthResponse(BaseModel):
     status: str = "ok"
     version: str = "0.1.0"
     sessions_active: int = 0
+    ws_connections: int = 0
+    components: dict[str, ComponentStatus] = {}

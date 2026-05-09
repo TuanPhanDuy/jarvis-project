@@ -141,6 +141,22 @@ def save_session_summary(
         pass
 
 
+def prune_old_preferences(db_path: Path, retention_days: int) -> int:
+    """Delete preferences not updated in the last retention_days. Returns rows deleted."""
+    cutoff = time.time() - retention_days * 86400
+    try:
+        conn = _get_conn(db_path)
+        cur = conn.execute("DELETE FROM user_preferences WHERE updated_at < ?", (cutoff,))
+        deleted = cur.rowcount
+        cur2 = conn.execute("DELETE FROM session_summaries WHERE created_at < ?", (cutoff,))
+        deleted += cur2.rowcount
+        conn.commit()
+        conn.close()
+        return deleted
+    except Exception:
+        return 0
+
+
 def handle_update_user_preference(tool_input: dict, db_path: Path, user_id: str) -> str:
     try:
         category = tool_input["category"]

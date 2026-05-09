@@ -22,6 +22,7 @@ class EvalCase:
     forbidden: list[str] = field(default_factory=list)
     judge_rubric: str = ""
     tags: list[str] = field(default_factory=list)
+    timeout_seconds: int = 120
 
 
 def load_suite(path: Path) -> list[EvalCase]:

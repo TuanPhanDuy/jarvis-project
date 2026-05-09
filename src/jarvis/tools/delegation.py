@@ -1,37 +1,19 @@
-"""Tool: delegate_task — spawn a specialized sub-agent and return its result.
-
-Used by PlannerAgent to delegate work to ResearcherAgent, CoderAgent, or QAAgent.
-Sub-agents receive the base tool registry (no recursive delegation) to prevent
-infinite loops.
-
-The handler is created via build_delegation_handler() which injects the shared
-Anthropic client and sub-agent tool registry.
-"""
+"""Tool: delegate_task — spawn a specialist sub-agent and return its result."""
 from __future__ import annotations
 
 from collections.abc import Callable
 
-import anthropic
-
 
 def build_delegation_handler(
-    client: anthropic.Anthropic,
     model: str,
     max_tokens: int,
     sub_tool_schemas: list[dict],
     sub_tool_registry: dict[str, Callable[[dict], str]],
 ) -> Callable[[dict], str]:
-    """Return a handler for the delegate_task tool.
+    """Return a handler that delegates tasks to specialist sub-agents.
 
-    Sub-agents are created with sub_tool_schemas / sub_tool_registry — they do NOT
-    have the delegate_task tool themselves, preventing recursive delegation.
-
-    Args:
-        client: Shared Anthropic client.
-        model: Model name to use for sub-agents.
-        max_tokens: Token budget for sub-agent responses.
-        sub_tool_schemas: Tool schemas available to sub-agents (no delegate_task).
-        sub_tool_registry: Tool handlers available to sub-agents.
+    Sub-agents receive base tools only (no delegate_task) to prevent
+    recursive delegation loops.
     """
 
     def handle_delegate_task(tool_input: dict) -> str:
@@ -41,7 +23,6 @@ def build_delegation_handler(
         if not task:
             return "ERROR: 'task' is required"
 
-        # Lazy imports avoid circular dependencies at module load time
         from jarvis.agents.coder import CoderAgent
         from jarvis.agents.qa import QAAgent
         from jarvis.agents.researcher import ResearcherAgent
@@ -56,19 +37,17 @@ def build_delegation_handler(
         if AgentClass is None:
             return (
                 f"ERROR: unknown agent_type '{agent_type}'. "
-                f"Valid options: {', '.join(agent_classes)}"
+                f"Valid: {', '.join(agent_classes)}"
             )
 
         try:
             agent = AgentClass(
-                client=client,
                 model=model,
                 max_tokens=max_tokens,
                 tool_schemas=sub_tool_schemas,
                 tool_registry=sub_tool_registry,
             )
-            messages = [{"role": "user", "content": task}]
-            result, _ = agent.run_turn(messages)
+            result, _ = agent.run_turn([{"role": "user", "content": task}])
             return f"[{agent_type.upper()} RESULT]\n{result}"
         except Exception as e:
             return f"ERROR: delegation to '{agent_type}' failed — {e}"
@@ -79,10 +58,10 @@ def build_delegation_handler(
 SCHEMA: dict = {
     "name": "delegate_task",
     "description": (
-        "Delegate a task to a specialized sub-agent and receive its result. "
-        "Use this when the user's request matches a specialist: "
-        "'researcher' for AI/ML research, 'coder' for writing/running code, "
-        "'qa' for reviewing or testing code."
+        "Delegate a task to a specialist sub-agent and receive its result. "
+        "- 'researcher': web research, information gathering, topic synthesis\n"
+        "- 'coder': write, run, and explain code\n"
+        "- 'qa': review code for bugs, edge cases, and quality"
     ),
     "input_schema": {
         "type": "object",
@@ -95,8 +74,8 @@ SCHEMA: dict = {
             "task": {
                 "type": "string",
                 "description": (
-                    "A clear, self-contained task description. Include all context the "
-                    "sub-agent needs — it has no memory of the current conversation."
+                    "A clear, self-contained task description with all the context needed. "
+                    "The sub-agent has no memory of the current conversation."
                 ),
             },
         },

@@ -30,9 +30,20 @@ class SystemMonitor:
     DISK_FREE_THRESHOLD = 10.0
     INTERVAL = 60
 
+    ALERT_COOLDOWN = 300  # seconds between repeat alerts for the same metric
+
     def __init__(self, bus: EventBus) -> None:
         self._bus = bus
         self._cpu_strikes = 0
+        self._last_fired: dict[str, float] = {}
+
+    def _cooldown_ok(self, metric: str) -> bool:
+        import time as _time
+        return _time.time() - self._last_fired.get(metric, 0) > self.ALERT_COOLDOWN
+
+    def _mark_fired(self, metric: str) -> None:
+        import time as _time
+        self._last_fired[metric] = _time.time()
 
     async def run(self) -> None:
         try:
@@ -51,24 +62,27 @@ class SystemMonitor:
 
                 if cpu > self.CPU_THRESHOLD:
                     self._cpu_strikes += 1
-                    if self._cpu_strikes >= 2:
+                    if self._cpu_strikes >= 2 and self._cooldown_ok("cpu"):
                         await self._bus.publish(SystemEvent(
                             metric="cpu", value=cpu, threshold=self.CPU_THRESHOLD, severity="warning"
                         ))
+                        self._mark_fired("cpu")
                         self._cpu_strikes = 0
                 else:
                     self._cpu_strikes = 0
 
-                if mem > self.MEM_THRESHOLD:
+                if mem > self.MEM_THRESHOLD and self._cooldown_ok("memory"):
                     await self._bus.publish(SystemEvent(
                         metric="memory", value=mem, threshold=self.MEM_THRESHOLD, severity="warning"
                     ))
+                    self._mark_fired("memory")
 
                 free_pct = 100 - disk
-                if free_pct < self.DISK_FREE_THRESHOLD:
+                if free_pct < self.DISK_FREE_THRESHOLD and self._cooldown_ok("disk"):
                     await self._bus.publish(SystemEvent(
                         metric="disk", value=free_pct, threshold=self.DISK_FREE_THRESHOLD, severity="alert"
                     ))
+                    self._mark_fired("disk")
             except Exception as exc:
                 log.error("system_monitor_error", error=str(exc))
 
@@ -126,13 +140,31 @@ class FileWatcher:
     def __init__(self, bus: EventBus, watch_dir: Path) -> None:
         self._bus = bus
         self._watch_dir = watch_dir
-        self._seen: set[str] = set()
+        self._sidecar = watch_dir / ".file_watcher_seen.json"
+        self._seen: set[str] = self._load_seen()
+
+    def _load_seen(self) -> set[str]:
+        try:
+            import json
+            if self._sidecar.exists():
+                return set(json.loads(self._sidecar.read_text()))
+        except Exception:
+            pass
+        return set()
+
+    def _save_seen(self) -> None:
+        try:
+            import json
+            self._sidecar.write_text(json.dumps(list(self._seen)))
+        except Exception:
+            pass
 
     async def run(self) -> None:
         if not self._watch_dir.exists():
             return
-        # Seed with existing files
-        self._seen = {f.name for f in self._watch_dir.glob("*.md")}
+        if not self._seen:
+            self._seen = {f.name for f in self._watch_dir.glob("*.md")}
+            self._save_seen()
         log.info("file_watcher_started", dir=str(self._watch_dir))
         while True:
             await asyncio.sleep(self.INTERVAL)
@@ -147,5 +179,6 @@ class FileWatcher:
                     ))
                     log.info("new_report_detected", filename=fname)
                 self._seen = current
+                self._save_seen()
             except Exception as exc:
                 log.error("file_watcher_error", error=str(exc))

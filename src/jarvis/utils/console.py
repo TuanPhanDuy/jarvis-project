@@ -16,7 +16,7 @@ def print_welcome() -> None:
         Panel.fit(
             "[bold cyan]J.A.R.V.I.S[/bold cyan]\n"
             "[dim]Just A Rather Very Intelligent System[/dim]\n\n"
-            "[white]AI Research Agent — powered by Claude[/white]\n"
+            "[white]AI Research Agent — powered by Ollama[/white]\n"
             "[dim]Type your research question. Type [bold]exit[/bold] to quit.[/dim]",
             border_style="cyan",
         )
@@ -94,13 +94,12 @@ def print_usage_summary(usage: dict) -> None:
     table.add_column("Metric", style="cyan")
     table.add_column("Value", justify="right")
 
-    table.add_row("Input tokens", f"{usage['input_tokens']:,}")
-    table.add_row("Output tokens", f"{usage['output_tokens']:,}")
-    table.add_row("Cache write tokens", f"{usage['cache_write_tokens']:,}")
-    table.add_row("Cache read tokens", f"{usage['cache_read_tokens']:,}")
+    table.add_row("Prompt tokens", f"{usage.get('prompt_tokens', 0):,}")
+    table.add_row("Completion tokens", f"{usage.get('completion_tokens', 0):,}")
+    table.add_row("Total tokens", f"{usage.get('total_tokens', 0):,}")
     table.add_row(
-        "[bold]Estimated cost[/bold]",
-        f"[bold green]${usage['estimated_cost_usd']:.4f}[/bold green]",
+        "[bold]Cost[/bold]",
+        "[bold green]$0.00 (local model)[/bold green]",
     )
 
     console.print()

@@ -1,14 +1,6 @@
-"""PlannerAgent — the default JARVIS orchestrator.
-
-Routes user requests to the right specialist (researcher, coder, qa) via the
-delegate_task tool, or handles simple questions directly. Synthesizes
-sub-agent results into a final response.
-"""
 from __future__ import annotations
 
 from collections.abc import Callable
-
-import anthropic
 
 from jarvis.agents.base_agent import BaseAgent
 from jarvis.prompts.loader import load_prompt
@@ -19,7 +11,6 @@ class PlannerAgent(BaseAgent):
 
     def __init__(
         self,
-        client: anthropic.Anthropic,
         model: str,
         max_tokens: int,
         tool_schemas: list[dict],
@@ -30,7 +21,7 @@ class PlannerAgent(BaseAgent):
         session_count: int = 0,
     ) -> None:
         super().__init__(
-            client, model, max_tokens, tool_schemas, tool_registry,
+            model, max_tokens, tool_schemas, tool_registry,
             approval_gate=approval_gate, session_id=session_id, user_id=user_id,
         )
         self._messages: list[dict] = []
@@ -40,7 +31,6 @@ class PlannerAgent(BaseAgent):
         base = load_prompt("planner")
         extras: list[str] = []
 
-        # Inject user preference context if user is known
         if self._user_id and self._user_id != "anonymous":
             try:
                 from jarvis.config import get_settings
@@ -60,7 +50,6 @@ class PlannerAgent(BaseAgent):
         return base + ("\n\n" + "\n\n".join(extras) if extras else "")
 
     def get_messages(self) -> list[dict]:
-        """Return the current conversation history (used by export_conversation tool)."""
         return self._messages
 
     def run_conversation(
@@ -70,14 +59,6 @@ class PlannerAgent(BaseAgent):
         get_input: Callable[[], str],
         on_chunk: Callable[[str], None] | None = None,
     ) -> None:
-        """Interactive REPL driven by the planner.
-
-        Args:
-            on_response: Called with the final assistant text each turn.
-            on_thinking: Called when the agent is working (shows a spinner).
-            get_input: Called to get the next user message. Return empty to exit.
-            on_chunk: If provided, stream text chunks as they arrive.
-        """
         self._messages = []
         while True:
             user_input = get_input()

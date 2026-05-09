@@ -1,13 +1,7 @@
-"""TeamAgent — a role-specialised agent for multi-agent team coordination.
-
-Each instance represents a specific team role (manager, team_lead, frontend, backend).
-The role determines the system prompt and the set of tools available.
-"""
+"""TeamAgent — a role-specialised agent for multi-agent team coordination."""
 from __future__ import annotations
 
 from collections.abc import Callable
-
-import anthropic
 
 from jarvis.agents.base_agent import BaseAgent
 from jarvis.prompts.loader import load_prompt
@@ -16,11 +10,8 @@ VALID_ROLES = ("manager", "team_lead", "frontend", "backend")
 
 
 class TeamAgent(BaseAgent):
-    """An agent with a team role persona."""
-
     def __init__(
         self,
-        client: anthropic.Anthropic,
         model: str,
         max_tokens: int,
         tool_schemas: list[dict],
@@ -31,7 +22,7 @@ class TeamAgent(BaseAgent):
         user_id: str | None = None,
     ) -> None:
         super().__init__(
-            client, model, max_tokens, tool_schemas, tool_registry,
+            model, max_tokens, tool_schemas, tool_registry,
             approval_gate=approval_gate, session_id=session_id, user_id=user_id,
         )
         if role not in VALID_ROLES:

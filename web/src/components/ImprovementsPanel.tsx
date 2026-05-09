@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { RefreshCw, Lightbulb, AlertCircle } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { api } from '../api'
 
 export function ImprovementsPanel() {
@@ -21,40 +23,6 @@ export function ImprovementsPanel() {
   }
 
   useEffect(() => { load() }, [])
-
-  // Very simple markdown → plain text for display
-  const renderLines = (text: string) =>
-    text.split('\n').map((line, i) => {
-      if (line.startsWith('## ') || line.startsWith('# ')) {
-        return (
-          <p key={i} className="text-xs font-semibold text-cyan-300 mt-3 mb-1">
-            {line.replace(/^#{1,3} /, '')}
-          </p>
-        )
-      }
-      if (line.startsWith('- ') || line.startsWith('• ')) {
-        return (
-          <p key={i} className="text-xs text-gray-400 pl-2">
-            {line}
-          </p>
-        )
-      }
-      if (line.startsWith('**') && line.endsWith('**')) {
-        return (
-          <p key={i} className="text-xs font-medium text-gray-300">
-            {line.replace(/\*\*/g, '')}
-          </p>
-        )
-      }
-      if (line.trim() === '') {
-        return <div key={i} className="h-1" />
-      }
-      return (
-        <p key={i} className="text-xs text-gray-400">
-          {line}
-        </p>
-      )
-    })
 
   return (
     <div className="flex flex-col gap-3 p-3">
@@ -80,8 +48,10 @@ export function ImprovementsPanel() {
       )}
 
       {content && !loading && (
-        <div className="overflow-y-auto max-h-96 space-y-0.5">
-          {renderLines(content)}
+        <div className="overflow-y-auto max-h-96 prose-jarvis text-xs">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+            {content}
+          </ReactMarkdown>
         </div>
       )}
     </div>

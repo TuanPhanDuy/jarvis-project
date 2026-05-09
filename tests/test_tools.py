@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis.tools.report_writer import handle_save_report
+from jarvis.tools.report_writer import handle_save_report, handle_update_report
 from jarvis.tools.web_search import SCHEMA as WEB_SEARCH_SCHEMA
 from jarvis.tools.report_writer import SCHEMA as SAVE_REPORT_SCHEMA
 from jarvis.tools.os_command import handle_run_command, SCHEMA as OS_COMMAND_SCHEMA
@@ -44,6 +44,34 @@ class TestReportWriter:
 
     def test_returns_error_string_on_bad_input(self, tmp_path: Path) -> None:
         result = handle_save_report({}, reports_dir=tmp_path)
+        assert result.startswith("ERROR:")
+
+
+class TestUpdateReport:
+    def test_appends_section_to_existing_report(self, tmp_path: Path) -> None:
+        handle_save_report(
+            {"title": "Original", "content": "Body.", "topic": "orig"},
+            reports_dir=tmp_path,
+        )
+        fname = next(tmp_path.glob("*.md")).name
+        result = handle_update_report(
+            {"filename": fname, "section_title": "New Section", "section_content": "Extra content."},
+            reports_dir=tmp_path,
+        )
+        assert "ERROR" not in result
+        text = (tmp_path / fname).read_text()
+        assert "New Section" in text
+        assert "Extra content." in text
+
+    def test_missing_file_returns_error(self, tmp_path: Path) -> None:
+        result = handle_update_report(
+            {"filename": "nonexistent.md", "section_title": "S", "section_content": "C"},
+            reports_dir=tmp_path,
+        )
+        assert result.startswith("ERROR:")
+
+    def test_missing_keys_returns_error(self, tmp_path: Path) -> None:
+        result = handle_update_report({}, reports_dir=tmp_path)
         assert result.startswith("ERROR:")
 
 

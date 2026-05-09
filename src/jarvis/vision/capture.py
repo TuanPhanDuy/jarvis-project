@@ -1,4 +1,4 @@
-"""Tools: capture_camera (YOLO detection) and describe_scene (Claude vision captioning)."""
+"""Tools: capture_camera (YOLO detection) and describe_scene (Ollama vision)."""
 from __future__ import annotations
 
 import base64
@@ -23,7 +23,7 @@ def handle_capture_camera(tool_input: dict, screenshots_dir: Path) -> str:
         if not ret or frame is None:
             return "ERROR: Failed to capture frame from camera."
 
-        model = YOLO("yolov8n.pt")  # nano model — auto-downloads on first use
+        model = YOLO("yolov8n.pt")
         results = model(frame, verbose=False)
 
         detections = []
@@ -48,54 +48,47 @@ def handle_capture_camera(tool_input: dict, screenshots_dir: Path) -> str:
         return f"ERROR: capture_camera failed — {e}"
 
 
-def handle_describe_scene(tool_input: dict, screenshots_dir: Path, api_key: str) -> str:
-    """Capture a webcam frame and return a natural-language scene description via Claude vision."""
+def handle_describe_scene(tool_input: dict, screenshots_dir: Path, vision_model: str) -> str:
+    """Describe a scene from a webcam frame or an image file via Ollama vision."""
     try:
-        import cv2
-        import anthropic
+        import ollama
 
-        camera_index = int(tool_input.get("camera_index", 0))
         prompt = str(tool_input.get("prompt", "Describe what you see in detail."))
+        image_path = str(tool_input.get("image_path", "")).strip()
 
-        cap = cv2.VideoCapture(camera_index)
-        if not cap.isOpened():
-            return "ERROR: Could not open camera."
-        ret, frame = cap.read()
-        cap.release()
+        if image_path:
+            # Analyze an existing image file
+            from pathlib import Path as _Path
+            path = _Path(image_path)
+            if not path.exists():
+                return f"ERROR: file not found — {image_path}"
+            img_b64 = base64.standard_b64encode(path.read_bytes()).decode()
+            source_label = f"(Image: {path.name})"
+        else:
+            # Capture from webcam
+            import cv2
+            camera_index = int(tool_input.get("camera_index", 0))
+            cap = cv2.VideoCapture(camera_index)
+            if not cap.isOpened():
+                return "ERROR: Could not open camera."
+            ret, frame = cap.read()
+            cap.release()
+            if not ret or frame is None:
+                return "ERROR: Failed to capture frame from camera."
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ok:
+                return "ERROR: Failed to encode frame as JPEG."
+            img_b64 = base64.standard_b64encode(buf.tobytes()).decode()
+            screenshots_dir.mkdir(parents=True, exist_ok=True)
+            out_path = screenshots_dir / f"scene_{int(time.time())}.jpg"
+            cv2.imwrite(str(out_path), frame)
+            source_label = f"(Snapshot saved: {out_path})"
 
-        if not ret or frame is None:
-            return "ERROR: Failed to capture frame from camera."
-
-        # Encode frame as JPEG bytes → base64
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if not ok:
-            return "ERROR: Failed to encode frame as JPEG."
-        img_b64 = base64.standard_b64encode(buf.tobytes()).decode()
-
-        # Save raw snapshot for audit
-        screenshots_dir.mkdir(parents=True, exist_ok=True)
-        out_path = screenshots_dir / f"scene_{int(time.time())}.jpg"
-        cv2.imwrite(str(out_path), frame)
-
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=512,
-            system=[{
-                "type": "text",
-                "text": "You are JARVIS's vision system. Describe what you see concisely and factually.",
-                "cache_control": {"type": "ephemeral"},
-            }],
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                    {"type": "text", "text": prompt},
-                ],
-            }],
+        response = ollama.chat(
+            model=vision_model,
+            messages=[{"role": "user", "content": prompt, "images": [img_b64]}],
         )
-        description = response.content[0].text
-        return f"Scene description: {description}\n(Snapshot saved: {out_path})"
+        return f"Scene description: {response.message.content}\n{source_label}"
 
     except Exception as e:
         return f"ERROR: describe_scene failed — {e}"
@@ -104,15 +97,20 @@ def handle_describe_scene(tool_input: dict, screenshots_dir: Path, api_key: str)
 DESCRIBE_SCHEMA: dict = {
     "name": "describe_scene",
     "description": (
-        "Take a webcam snapshot and return a natural-language description of the scene "
-        "using Claude's vision capability. More detailed than capture_camera's object labels."
+        "Describe a scene using the local Ollama vision model. "
+        "Either captures a live webcam frame (default) or analyzes an image file when 'image_path' is given. "
+        "Returns a natural-language description. More detailed than capture_camera's object labels."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
+            "image_path": {
+                "type": "string",
+                "description": "Path to an image file to analyze (JPG/PNG). If omitted, captures from webcam.",
+            },
             "camera_index": {
                 "type": "integer",
-                "description": "Camera device index (default 0 = primary webcam).",
+                "description": "Webcam device index (default 0). Ignored when image_path is set.",
                 "default": 0,
             },
             "prompt": {

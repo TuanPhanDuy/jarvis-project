@@ -1,25 +1,15 @@
-"""CoderAgent — specialized sub-agent for code generation and execution."""
+"""CoderAgent — writes, runs, and explains code."""
 from __future__ import annotations
 
 from collections.abc import Callable
-
-import anthropic
 
 from jarvis.agents.base_agent import BaseAgent
 from jarvis.prompts.loader import load_prompt
 
 
 class CoderAgent(BaseAgent):
-    """Sub-agent that writes, runs, and explains Python code.
-
-    Used exclusively as a delegation target from PlannerAgent — it has no
-    interactive REPL. The planner calls run_turn() with a single task and
-    receives the result as a string.
-    """
-
     def __init__(
         self,
-        client: anthropic.Anthropic,
         model: str,
         max_tokens: int,
         tool_schemas: list[dict],
@@ -29,7 +19,7 @@ class CoderAgent(BaseAgent):
         user_id: str | None = None,
     ) -> None:
         super().__init__(
-            client, model, max_tokens, tool_schemas, tool_registry,
+            model, max_tokens, tool_schemas, tool_registry,
             approval_gate=approval_gate, session_id=session_id, user_id=user_id,
         )
 

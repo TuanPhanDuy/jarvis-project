@@ -127,3 +127,28 @@ def ensure_admin_exists(db_path: Path, default_password: str = "changeme") -> No
     conn.close()
     if count == 0:
         create_user(db_path, "admin", default_password, role="admin")
+
+
+# ── FastAPI dependency ────────────────────────────────────────────────────────
+
+def make_auth_dependency(db_path: Path, jwt_secret: str, auth_enabled: bool):
+    """Return a FastAPI Depends-compatible callable for auth enforcement.
+
+    When auth_enabled=False the dependency is a no-op and returns None.
+    When auth_enabled=True it reads Bearer token from Authorization header
+    and raises HTTP 401 if missing or invalid.
+    """
+    def get_current_user(request):
+        if not auth_enabled:
+            return None
+        from fastapi import HTTPException as _HTTPException
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise _HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+        token = auth_header[len("Bearer "):]
+        user = verify_token(token, jwt_secret)
+        if user is None:
+            raise _HTTPException(status_code=401, detail="Invalid or expired token")
+        return user
+
+    return get_current_user

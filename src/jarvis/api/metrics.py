@@ -48,6 +48,13 @@ TOOL_CALLS_TOTAL = Counter(
     ["tool_name"],
 )
 
+TOOL_DURATION = Histogram(
+    "jarvis_tool_duration_seconds",
+    "Wall-clock time for individual tool executions",
+    ["tool_name"],
+    buckets=[0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+)
+
 # ── Queue ────────────────────────────────────────────────────────────────────
 QUEUE_TASKS_PUBLISHED = Counter(
     "jarvis_queue_tasks_published_total",

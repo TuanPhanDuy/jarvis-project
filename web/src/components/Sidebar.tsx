@@ -1,11 +1,14 @@
-import { CalendarClock, Shield, Network, Star, Lightbulb, ChevronLeft, ChevronRight } from 'lucide-react'
+import { CalendarClock, Shield, Network, Star, Lightbulb, FileText, ChevronLeft, ChevronRight, Brain, BarChart2 } from 'lucide-react'
 import { SchedulePanel } from './SchedulePanel'
 import { AuditPanel } from './AuditPanel'
 import { DigitalTwinPanel } from './DigitalTwinPanel'
 import { FeedbackChart } from './FeedbackChart'
 import { ImprovementsPanel } from './ImprovementsPanel'
+import { ReportsPanel } from './ReportsPanel'
+import { MemoryPanel } from './MemoryPanel'
+import { MetricsPanel } from './MetricsPanel'
 
-export type SidebarTab = 'schedules' | 'audit' | 'twin' | 'feedback' | 'improvements'
+export type SidebarTab = 'schedules' | 'audit' | 'twin' | 'feedback' | 'improvements' | 'reports' | 'memory' | 'metrics'
 
 interface SidebarProps {
   open: boolean
@@ -17,6 +20,9 @@ interface SidebarProps {
 
 const TABS: { id: SidebarTab; label: string; icon: React.ReactNode }[] = [
   { id: 'schedules', label: 'Schedules', icon: <CalendarClock size={14} /> },
+  { id: 'reports', label: 'Reports', icon: <FileText size={14} /> },
+  { id: 'memory', label: 'Memory', icon: <Brain size={14} /> },
+  { id: 'metrics', label: 'Metrics', icon: <BarChart2 size={14} /> },
   { id: 'audit', label: 'Audit', icon: <Shield size={14} /> },
   { id: 'twin', label: 'Twin', icon: <Network size={14} /> },
   { id: 'feedback', label: 'Ratings', icon: <Star size={14} /> },
@@ -63,6 +69,9 @@ export function Sidebar({ open, onToggle, activeTab, onTabChange, sessionId }: S
           {/* Content */}
           <div className="flex-1 overflow-y-auto">
             {activeTab === 'schedules' && <SchedulePanel sessionId={sessionId} />}
+            {activeTab === 'reports' && <ReportsPanel />}
+            {activeTab === 'memory' && <MemoryPanel />}
+            {activeTab === 'metrics' && <MetricsPanel />}
             {activeTab === 'audit' && <AuditPanel sessionId={sessionId} />}
             {activeTab === 'twin' && <DigitalTwinPanel />}
             {activeTab === 'feedback' && <FeedbackChart sessionId={sessionId} />}

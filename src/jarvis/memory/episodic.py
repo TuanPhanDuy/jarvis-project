@@ -113,6 +113,20 @@ def handle_search_episodic_memory(tool_input: dict, db_path: Path, user_id: str 
         return f"ERROR: search_episodic_memory failed — {e}"
 
 
+def prune_old_episodes(db_path: Path, retention_days: int) -> int:
+    """Delete episodes older than retention_days. Returns number of rows deleted."""
+    cutoff = time.time() - retention_days * 86400
+    try:
+        conn = _get_conn(db_path)
+        cur = conn.execute("DELETE FROM episodes WHERE timestamp < ?", (cutoff,))
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+        return deleted
+    except Exception:
+        return 0
+
+
 SCHEMA: dict = {
     "name": "search_episodic_memory",
     "description": (

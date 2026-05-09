@@ -34,6 +34,17 @@ def _get_conn(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _normalize_rating(rating: int, rating_type: str) -> int:
+    """Convert any rating to the canonical 1-5 scale stored in the DB.
+
+    Thumbs-up (+1) maps to 5 (excellent); thumbs-down (-1) maps to 1 (poor).
+    Star ratings are clamped to [1, 5].
+    """
+    if rating_type == "thumbs":
+        return 5 if rating > 0 else 1
+    return max(1, min(5, rating))
+
+
 def log_feedback(
     db_path: Path,
     session_id: str,
@@ -41,13 +52,15 @@ def log_feedback(
     rating: int,
     comment: str = "",
     user_id: str = "anonymous",
+    rating_type: str = "stars",
 ) -> None:
-    """Store a rating for a JARVIS response. Rating: 1-5 or -1/+1."""
+    """Store a rating for a JARVIS response. Normalized to 1-5 scale before writing."""
+    normalized = _normalize_rating(rating, rating_type)
     msg_hash = hashlib.sha256(response_text.encode()).hexdigest()[:16]
     conn = _get_conn(db_path)
     conn.execute(
         "INSERT INTO feedback (session_id, user_id, msg_hash, rating, comment, ts) VALUES (?,?,?,?,?,?)",
-        (session_id, user_id, msg_hash, rating, comment, time.time()),
+        (session_id, user_id, msg_hash, normalized, comment, time.time()),
     )
     conn.commit()
     conn.close()
@@ -85,11 +98,26 @@ def handle_record_feedback(tool_input: dict, db_path: Path) -> str:
         rating = int(tool_input["rating"])
         comment = tool_input.get("comment", "")
         if not (-1 <= rating <= 5):
-            return "ERROR: rating must be -1 (thumbs down), +1 (thumbs up), or 1-5."
-        log_feedback(db_path, session_id, response_snippet, rating, comment)
-        return f"Feedback recorded (rating: {rating}). Thank you!"
+            return "ERROR: rating must be -1 (thumbs down), +1 (thumbs up), or 1-5 stars."
+        rating_type = "thumbs" if rating in (-1, 1) and tool_input.get("rating_type") != "stars" else "stars"
+        log_feedback(db_path, session_id, response_snippet, rating, comment, rating_type=rating_type)
+        return f"Feedback recorded. Thank you!"
     except Exception as e:
         return f"ERROR: record_feedback failed — {e}"
+
+
+def prune_old_feedback(db_path: Path, retention_days: int) -> int:
+    """Delete feedback older than retention_days. Returns number of rows deleted."""
+    cutoff = time.time() - retention_days * 86400
+    try:
+        conn = _get_conn(db_path)
+        cur = conn.execute("DELETE FROM feedback WHERE ts < ?", (cutoff,))
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+        return deleted
+    except Exception:
+        return 0
 
 
 SCHEMA: dict = {

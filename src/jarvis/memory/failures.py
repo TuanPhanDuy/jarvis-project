@@ -84,6 +84,20 @@ def handle_analyze_failures(tool_input: dict, db_path: Path) -> str:
         return f"ERROR: analyze_failures failed — {e}"
 
 
+def prune_old_failures(db_path: Path, retention_days: int) -> int:
+    """Delete failure records older than retention_days. Returns number of rows deleted."""
+    cutoff = time.time() - retention_days * 86400
+    try:
+        conn = _get_conn(db_path)
+        cur = conn.execute("DELETE FROM tool_failures WHERE timestamp < ?", (cutoff,))
+        deleted = cur.rowcount
+        conn.commit()
+        conn.close()
+        return deleted
+    except Exception:
+        return 0
+
+
 SCHEMA: dict = {
     "name": "analyze_failures",
     "description": (

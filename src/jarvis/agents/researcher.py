@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-import anthropic
-
 from jarvis.agents.base_agent import BaseAgent
 from jarvis.prompts.loader import load_prompt
 
@@ -11,7 +9,6 @@ from jarvis.prompts.loader import load_prompt
 class ResearcherAgent(BaseAgent):
     def __init__(
         self,
-        client: anthropic.Anthropic,
         model: str,
         max_tokens: int,
         tool_schemas: list[dict],
@@ -22,11 +19,12 @@ class ResearcherAgent(BaseAgent):
         user_id: str | None = None,
     ) -> None:
         super().__init__(
-            client, model, max_tokens, tool_schemas, tool_registry,
+            model, max_tokens, tool_schemas, tool_registry,
             approval_gate=approval_gate, session_id=session_id, user_id=user_id,
         )
         self._max_search_calls = max_search_calls
         self._search_calls_used = 0
+        self._messages: list[dict] = []
 
     def get_system_prompt(self) -> str:
         remaining = self._max_search_calls - self._search_calls_used
@@ -44,7 +42,6 @@ class ResearcherAgent(BaseAgent):
         super()._before_dispatch(name, tool_input)
 
     def get_messages(self) -> list[dict]:
-        """Return the current conversation history (used by export_conversation tool)."""
         return self._messages
 
     def run_conversation(
@@ -54,15 +51,7 @@ class ResearcherAgent(BaseAgent):
         get_input: Callable[[], str],
         on_chunk: Callable[[str], None] | None = None,
     ) -> None:
-        """Interactive REPL. Calls on_response with each assistant reply.
-
-        Args:
-            on_response: called with the final assistant text each turn
-            on_thinking: called when tool calls are in progress (status updates)
-            get_input: called to get the next user message; return empty string to exit
-            on_chunk: if provided, stream text chunks to this callback as they arrive
-        """
-        self._messages: list[dict] = []
+        self._messages = []
         while True:
             user_input = get_input()
             if not user_input or user_input.strip().lower() in ("exit", "quit", "bye"):
@@ -73,9 +62,4 @@ class ResearcherAgent(BaseAgent):
             on_response(response_text)
 
             if len(self._messages) > 40:
-                self._messages = self._trim_history(self._messages)
-
-    @staticmethod
-    def _trim_history(messages: list[dict]) -> list[dict]:
-        """Keep the last 20 turns to avoid hitting context limits."""
-        return messages[-20:]
+                self._messages = self._messages[-20:]

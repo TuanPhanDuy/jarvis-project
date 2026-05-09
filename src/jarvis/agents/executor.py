@@ -1,10 +1,8 @@
 """ExecutorAgent — runs a multi-step plan with dependency tracking and critique.
 
-Each step is executed by the appropriate specialist sub-agent. Results from
-completed steps are injected as context for dependent downstream steps.
-CriticAgent scores each output and triggers one retry for low-quality results.
-
-Plans are stored in the jarvis.db `plans` table for auditability.
+Each step is run by the appropriate specialist sub-agent. Results from completed
+steps are injected as context for dependent downstream steps. CriticAgent
+scores each output and triggers one retry for low-quality results.
 """
 from __future__ import annotations
 
@@ -15,8 +13,6 @@ import uuid
 from dataclasses import dataclass, field
 from collections.abc import Callable
 from pathlib import Path
-
-import anthropic
 
 import structlog
 
@@ -56,7 +52,6 @@ def _get_conn(db_path: Path) -> sqlite3.Connection:
 
 
 def _topo_sort(steps: list[PlanStep]) -> list[PlanStep]:
-    """Return steps in topological order respecting depends_on."""
     by_id = {s.id: s for s in steps}
     visited: set[str] = set()
     order: list[PlanStep] = []
@@ -76,17 +71,11 @@ def _topo_sort(steps: list[PlanStep]) -> list[PlanStep]:
 
 
 class ExecutorAgent:
-    """Executes a list of PlanSteps using specialist sub-agents.
-
-    Not a BaseAgent subclass — it orchestrates other agents rather than
-    talking to Claude directly.
-    """
+    """Executes a list of PlanSteps using specialist sub-agents."""
 
     def __init__(
         self,
-        client: anthropic.Anthropic,
         model: str,
-        fast_model: str,
         max_tokens: int,
         sub_tool_schemas: list[dict],
         sub_tool_registry: dict[str, Callable[[dict], str]],
@@ -94,9 +83,7 @@ class ExecutorAgent:
         session_id: str = "",
         user_id: str | None = None,
     ) -> None:
-        self._client = client
         self._model = model
-        self._fast_model = fast_model
         self._max_tokens = max_tokens
         self._sub_tool_schemas = sub_tool_schemas
         self._sub_tool_registry = sub_tool_registry
@@ -104,26 +91,20 @@ class ExecutorAgent:
         self._session_id = session_id
         self._user_id = user_id
 
-    def execute_plan(
-        self,
-        goal: str,
-        steps: list[PlanStep],
-    ) -> str:
-        """Execute all steps, return aggregated result summary."""
+    def execute_plan(self, goal: str, steps: list[PlanStep]) -> str:
         plan_id = str(uuid.uuid4())
         self._store_plan(plan_id, goal, steps)
 
         from jarvis.agents.critic import build_critic
-        critic = build_critic(self._client, self._fast_model, self._max_tokens)
+        critic = build_critic(self._model, self._max_tokens)
 
-        context: dict[str, str] = {}  # step_id → result
+        context: dict[str, str] = {}
         sorted_steps = _topo_sort(steps)
 
         for step in sorted_steps:
             step.status = "running"
             self._update_plan(plan_id, steps)
 
-            # Build context from upstream results
             dep_context = ""
             for dep_id in step.depends_on:
                 if dep_id in context:
@@ -135,31 +116,24 @@ class ExecutorAgent:
 
             result = self._run_step(step.agent_type, task)
 
-            # Critique and optionally retry once
             critique = critic.critique(step.description, result)
-            log.info(
-                "plan_step_critiqued",
-                plan_id=plan_id,
-                step_id=step.id,
-                score=critique.score,
-                retry=critique.should_retry,
-            )
+            log.info("plan_step_critiqued", plan_id=plan_id, step_id=step.id,
+                     score=critique.score, retry=critique.should_retry)
 
             if critique.should_retry and critique.revised_task:
                 revised = critique.revised_task
                 if dep_context:
                     revised = f"{revised}\n\nContext from previous steps:{dep_context}"
-                retry_result = self._run_step(step.agent_type, revised)
-                result = retry_result
+                result = self._run_step(step.agent_type, revised)
 
-            step.status = "done"
+            step.status = "failed" if result.startswith("ERROR:") else "done"
             step.result = result
             context[step.id] = result
             self._update_plan(plan_id, steps)
 
-        self._complete_plan(plan_id, steps)
+        any_failed = any(s.status == "failed" for s in sorted_steps)
+        self._complete_plan(plan_id, steps, failed=any_failed)
 
-        # Build a summary of all step results
         parts = [f"**Plan: {goal}**\n"]
         for step in sorted_steps:
             parts.append(f"### Step: {step.description}")
@@ -182,7 +156,6 @@ class ExecutorAgent:
             return f"ERROR: unknown agent_type '{agent_type}'"
         try:
             agent = AgentClass(
-                client=self._client,
                 model=self._model,
                 max_tokens=self._max_tokens,
                 tool_schemas=self._sub_tool_schemas,
@@ -202,7 +175,8 @@ class ExecutorAgent:
             conn = _get_conn(self._db_path)
             conn.execute(
                 "INSERT INTO plans (id, goal, steps_json, status, created_at, session_id, user_id) VALUES (?,?,?,?,?,?,?)",
-                (plan_id, goal, json.dumps([s.__dict__ for s in steps]), "running", time.time(), self._session_id, self._user_id),
+                (plan_id, goal, json.dumps([s.__dict__ for s in steps]), "running",
+                 time.time(), self._session_id, self._user_id),
             )
             conn.commit()
             conn.close()
@@ -214,23 +188,22 @@ class ExecutorAgent:
             return
         try:
             conn = _get_conn(self._db_path)
-            conn.execute(
-                "UPDATE plans SET steps_json = ? WHERE id = ?",
-                (json.dumps([s.__dict__ for s in steps]), plan_id),
-            )
+            conn.execute("UPDATE plans SET steps_json = ? WHERE id = ?",
+                         (json.dumps([s.__dict__ for s in steps]), plan_id))
             conn.commit()
             conn.close()
         except Exception:
             pass
 
-    def _complete_plan(self, plan_id: str, steps: list[PlanStep]) -> None:
+    def _complete_plan(self, plan_id: str, steps: list[PlanStep], failed: bool = False) -> None:
         if not self._db_path:
             return
         try:
+            status = "partial_failure" if failed else "done"
             conn = _get_conn(self._db_path)
             conn.execute(
-                "UPDATE plans SET status = 'done', completed_at = ?, steps_json = ? WHERE id = ?",
-                (time.time(), json.dumps([s.__dict__ for s in steps]), plan_id),
+                "UPDATE plans SET status = ?, completed_at = ?, steps_json = ? WHERE id = ?",
+                (status, time.time(), json.dumps([s.__dict__ for s in steps]), plan_id),
             )
             conn.commit()
             conn.close()

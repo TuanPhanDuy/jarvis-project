@@ -3,8 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-import anthropic
-
 from jarvis.tools import (
     browser,
     conversation_export,
@@ -13,7 +11,6 @@ from jarvis.tools import (
     os_command,
     plan_tool,
     report_writer,
-    team_delegation,
     url_reader,
     web_search,
 )
@@ -23,7 +20,6 @@ from jarvis.memory import feedback as memory_feedback
 from jarvis.memory import graph as knowledge_graph
 from jarvis.memory import preferences as user_preferences
 from jarvis.vision import capture as vision_capture, face as vision_face
-from jarvis.twin import main as digital_twin
 from jarvis.tools.plugin_loader import load_plugins
 
 
@@ -39,26 +35,17 @@ def _save_report_and_index(tool_input: dict, reports_dir: Path) -> str:
 
 
 def build_registry(
-    tavily_api_key: str,
     reports_dir: Path,
     get_messages: Callable[[], list[dict]] | None = None,
     allowed_commands: list[str] | None = None,
     user_id: str = "anonymous",
-    anthropic_api_key: str = "",
+    vision_model: str = "llava:13b",
 ) -> tuple[list[dict], dict[str, Callable[[dict], str]]]:
-    """Return (tool_schemas, tool_dispatch_map) bound to the given config.
-
-    Args:
-        tavily_api_key: API key for Tavily web search.
-        reports_dir: Directory where reports and exports are saved.
-        get_messages: Optional callable that returns the current conversation history.
-        allowed_commands: Allowlist of command basenames for run_command tool.
-    """
+    """Return (tool_schemas, tool_dispatch_map) bound to the given config."""
     _allowed = allowed_commands or []
     db_path = reports_dir / "jarvis.db"
     _uid = user_id or "anonymous"
 
-    # ── Built-in tool schemas ─────────────────────────────────────────────────
     schemas = [
         web_search.SCHEMA,
         report_writer.SCHEMA,
@@ -81,12 +68,9 @@ def build_registry(
         vision_capture.SCHEMA,
         vision_capture.DESCRIBE_SCHEMA,
         vision_face.SCHEMA,
-        # Digital Twin
-        digital_twin.SNAPSHOT_SCHEMA,
-        digital_twin.QUERY_SCHEMA,
     ]
     registry: dict[str, Callable[[dict], str]] = {
-        "web_search":               lambda inp: web_search.handle_web_search(inp, tavily_api_key),
+        "web_search":               lambda inp: web_search.handle_web_search(inp),
         "save_report":              lambda inp: _save_report_and_index(inp, reports_dir),
         "update_report":            lambda inp: report_writer.handle_update_report(inp, reports_dir),
         "read_url":                 lambda inp: url_reader.handle_read_url(inp),
@@ -107,14 +91,10 @@ def build_registry(
         "recall_user_preferences":  lambda inp: user_preferences.handle_recall_user_preferences(inp, db_path, _uid),
         # Vision
         "capture_camera":           lambda inp: vision_capture.handle_capture_camera(inp, reports_dir),
-        "describe_scene":           lambda inp: vision_capture.handle_describe_scene(inp, reports_dir, anthropic_api_key),
+        "describe_scene":           lambda inp: vision_capture.handle_describe_scene(inp, reports_dir, vision_model),
         "recognize_face":           lambda inp: vision_face.handle_recognize_face(inp, reports_dir),
-        # Digital Twin
-        "snapshot_system":          lambda inp: digital_twin.handle_snapshot_system(inp, db_path),
-        "query_system_twin":        lambda inp: digital_twin.handle_query_system_twin(inp, db_path),
     }
 
-    # ── Plugin tools (auto-discovered from tools/plugins/) ────────────────────
     plugin_schemas, plugin_registry = load_plugins()
     schemas.extend(plugin_schemas)
     registry.update(plugin_registry)
@@ -125,42 +105,21 @@ def build_registry(
 def build_planner_registry(
     base_schemas: list[dict],
     base_registry: dict[str, Callable[[dict], str]],
-    client: anthropic.Anthropic,
     model: str,
     max_tokens: int,
+    db_path: Path | None = None,
     session_id: str = "",
     user_id: str | None = None,
 ) -> tuple[list[dict], dict[str, Callable[[dict], str]]]:
-    """Extend a base registry with the delegate_task tool for PlannerAgent.
-
-    Sub-agents spawned by the delegation handler receive base_schemas/base_registry
-    (no delegate_task), preventing recursive delegation.
-
-    Args:
-        base_schemas: Tool schemas from build_registry() — no delegate_task.
-        base_registry: Tool handlers from build_registry() — no delegate_task.
-        client: Shared Anthropic client passed to spawned sub-agents.
-        model: Model name for sub-agents.
-        max_tokens: Token budget for sub-agent responses.
-        session_id: Session identifier threaded into sub-agents.
-        user_id: User identifier threaded into sub-agents.
-    """
-    from jarvis.config import get_settings
-
-    settings = get_settings()
-    db_path = settings.reports_dir / "jarvis.db"
-
+    """Extend a base registry with delegate_task and create_plan for PlannerAgent."""
     delegation_handler = delegation.build_delegation_handler(
-        client=client,
         model=model,
         max_tokens=max_tokens,
         sub_tool_schemas=base_schemas,
         sub_tool_registry=base_registry,
     )
     plan_handler = plan_tool.build_plan_handler(
-        client=client,
         model=model,
-        fast_model=settings.fast_model,
         max_tokens=max_tokens,
         sub_tool_schemas=base_schemas,
         sub_tool_registry=base_registry,
@@ -173,62 +132,3 @@ def build_planner_registry(
     planner_registry["delegate_task"] = delegation_handler
     planner_registry["create_plan"] = plan_handler
     return planner_schemas, planner_registry
-
-
-def build_team_registry(
-    base_schemas: list[dict],
-    base_registry: dict[str, Callable[[dict], str]],
-    client: anthropic.Anthropic,
-    model: str,
-    max_tokens: int,
-) -> tuple[list[dict], dict[str, Callable[[dict], str]]]:
-    """Build a registry for TeamAgent in Manager role.
-
-    Hierarchy:
-      Manager  → can delegate to team_lead, frontend, backend
-      Team Lead → can delegate to frontend, backend
-      Frontend / Backend → leaf nodes (base tools only)
-
-    Args:
-        base_schemas: Tool schemas from build_registry() — no team delegation.
-        base_registry: Tool handlers from build_registry() — no team delegation.
-        client: Shared Anthropic client passed to spawned sub-agents.
-        model: Model name for sub-agents.
-        max_tokens: Token budget for sub-agent responses.
-    """
-    # Leaf agents: frontend and backend get the base tool set only
-    leaf_configs: dict[str, tuple[list[dict], dict[str, Callable[[dict], str]]]] = {
-        "frontend": (base_schemas, base_registry),
-        "backend": (base_schemas, base_registry),
-    }
-
-    # Team Lead can delegate to frontend and backend
-    tl_handler = team_delegation.build_team_delegation_handler(
-        client=client,
-        model=model,
-        max_tokens=max_tokens,
-        role_configs=leaf_configs,
-        allowed_roles=["frontend", "backend"],
-    )
-    tl_schemas = base_schemas + [team_delegation.SCHEMA]
-    tl_registry: dict[str, Callable[[dict], str]] = dict(base_registry)
-    tl_registry["delegate_to_team_member"] = tl_handler
-
-    # Manager can delegate to team_lead (with its delegation power), frontend, backend
-    manager_configs: dict[str, tuple[list[dict], dict[str, Callable[[dict], str]]]] = {
-        "team_lead": (tl_schemas, tl_registry),
-        "frontend": (base_schemas, base_registry),
-        "backend": (base_schemas, base_registry),
-    }
-    mgr_handler = team_delegation.build_team_delegation_handler(
-        client=client,
-        model=model,
-        max_tokens=max_tokens,
-        role_configs=manager_configs,
-        allowed_roles=["team_lead", "frontend", "backend"],
-    )
-    mgr_schemas = base_schemas + [team_delegation.SCHEMA]
-    mgr_registry: dict[str, Callable[[dict], str]] = dict(base_registry)
-    mgr_registry["delegate_to_team_member"] = mgr_handler
-
-    return mgr_schemas, mgr_registry

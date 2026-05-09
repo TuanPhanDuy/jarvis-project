@@ -1,20 +1,12 @@
-"""Eval runner: execute an eval suite against JARVIS and score results.
-
-Scoring:
-  - contains_pass: all expected_contains strings found (case-insensitive)
-  - forbidden_pass: no forbidden strings found
-  - judge_score: 1-5 from Claude-as-judge (only when judge_rubric is set)
-  - overall_pass: contains_pass AND forbidden_pass
-
-Usage:
-    from jarvis.evals.runner import run_suite
-    from jarvis.evals.suite import BASELINE_SUITE
-    results = run_suite(BASELINE_SUITE, settings)
-"""
+"""Eval runner: execute an eval suite against JARVIS and score results."""
 from __future__ import annotations
 
+import dataclasses
+import json
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from jarvis.evals.suite import EvalCase
@@ -44,25 +36,24 @@ def _score_case(case: EvalCase, response: str) -> tuple[bool, bool, list[str], l
     return not failed_contains, not failed_forbidden, failed_contains, failed_forbidden
 
 
-def _judge(case: EvalCase, response: str, client, model: str) -> tuple[int, str]:
-    """Ask Claude to score the response 1-5 against the rubric."""
+def _judge(case: EvalCase, response: str, model: str) -> tuple[int, str]:
+    """Score the response 1-5 against the rubric using the local Ollama model."""
     if not case.judge_rubric:
         return 0, ""
+    import ollama
     prompt = (
         f"Rate this AI response from 1 (very poor) to 5 (excellent) against this rubric:\n\n"
         f"**Rubric:** {case.judge_rubric}\n\n"
         f"**Question:** {case.prompt}\n\n"
         f"**Response:** {response[:1500]}\n\n"
-        f"Reply with JSON: {{\"score\": <1-5>, \"reasoning\": \"<one sentence>\"}}"
+        f"Reply with JSON only: {{\"score\": <1-5>, \"reasoning\": \"<one sentence>\"}}"
     )
     try:
-        import json
-        resp = client.messages.create(
+        resp = ollama.chat(
             model=model,
-            max_tokens=256,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = resp.content[0].text.strip()
+        text = resp.message.content.strip()
         data = json.loads(text[text.find("{"):text.rfind("}") + 1])
         return int(data.get("score", 0)), data.get("reasoning", "")
     except Exception as e:
@@ -75,24 +66,20 @@ def run_suite(
     use_judge: bool = False,
     tags_filter: list[str] | None = None,
 ) -> list[EvalResult]:
-    """Run all eval cases and return results."""
-    import anthropic
     from jarvis.tools.registry import build_registry
     from jarvis.agents.researcher import ResearcherAgent
 
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     tool_schemas, tool_registry = build_registry(
-        tavily_api_key=settings.tavily_api_key,
         reports_dir=settings.reports_dir,
-        anthropic_api_key=settings.anthropic_api_key,
+        vision_model=settings.vision_model,
     )
 
     filtered = [c for c in cases if not tags_filter or any(t in c.tags for t in tags_filter)]
     results: list[EvalResult] = []
+    _pool = ThreadPoolExecutor(max_workers=1)
 
     for case in filtered:
         agent = ResearcherAgent(
-            client=client,
             model=settings.model,
             max_tokens=settings.max_tokens,
             tool_schemas=tool_schemas,
@@ -102,8 +89,10 @@ def run_suite(
         error = ""
         response = ""
         try:
-            messages = [{"role": "user", "content": case.prompt}]
-            response, _ = agent.run_turn(messages)
+            future = _pool.submit(agent.run_turn, [{"role": "user", "content": case.prompt}])
+            response, _ = future.result(timeout=case.timeout_seconds)
+        except FuturesTimeoutError:
+            error = "timed_out"
         except Exception as e:
             error = str(e)
 
@@ -113,8 +102,9 @@ def run_suite(
 
         judge_score, judge_reason = None, ""
         if use_judge and case.judge_rubric and response:
-            judge_score, judge_reason = _judge(case, response, client, settings.model)
-            judge_score = judge_score or None
+            score, reason = _judge(case, response, settings.model)
+            judge_score = score or None
+            judge_reason = reason
 
         results.append(EvalResult(
             case_id=case.id,
@@ -124,7 +114,7 @@ def run_suite(
             forbidden_pass=forbidden_ok,
             overall_pass=contains_ok and forbidden_ok and not error,
             latency_s=round(latency, 2),
-            cost_usd=usage["estimated_cost_usd"],
+            cost_usd=usage.get("estimated_cost_usd", 0.0),
             failed_contains=failed_c,
             failed_forbidden=failed_f,
             judge_score=judge_score,
@@ -133,6 +123,21 @@ def run_suite(
         ))
 
     return results
+
+
+def persist_results(results: list[EvalResult], summary: dict, output_dir: Path) -> None:
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        history_path = output_dir / "eval_history.jsonl"
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+            "results": [dataclasses.asdict(r) for r in results],
+        }
+        with history_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
 
 
 def summarize(results: list[EvalResult]) -> dict:

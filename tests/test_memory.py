@@ -6,9 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from jarvis.memory.episodic import log_episode, handle_search_episodic_memory
+from jarvis.memory.episodic import log_episode, handle_search_episodic_memory, prune_old_episodes
 from jarvis.memory.graph import handle_update_knowledge_graph, handle_query_knowledge_graph
-from jarvis.memory.feedback import log_feedback, get_feedback_stats, handle_record_feedback
+from jarvis.memory.feedback import log_feedback, get_feedback_stats, handle_record_feedback, prune_old_feedback
+from jarvis.memory.failures import prune_old_failures
+from jarvis.memory.preferences import upsert_preference, get_preferences, prune_old_preferences
 
 
 # ── Episodic memory ───────────────────────────────────────────────────────────
@@ -52,6 +54,28 @@ class TestEpisodicMemory:
         result = handle_search_episodic_memory({"query": "transformers", "limit": 3}, db)
         # Should return at most 3 entries — count occurrence of role prefix
         assert result.count("[user]") <= 3
+
+    def test_like_fallback_when_fts5_missing(self, tmp_path: Path) -> None:
+        """Verify LIKE fallback is used when FTS5 virtual table is unavailable."""
+        import sqlite3
+        from jarvis.memory.episodic import _search
+
+        db = tmp_path / "jarvis.db"
+        log_episode(db, "sess1", "user", "discussion about neural networks")
+
+        # Drop the FTS5 virtual table to simulate environment without FTS5
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute("DROP TABLE IF EXISTS episodes_fts")
+            conn.execute("DROP TRIGGER IF EXISTS episodes_ai")
+        except Exception:
+            pass
+        conn.commit()
+        conn.close()
+
+        rows = _search(db, "neural", limit=5)
+        assert len(rows) >= 1
+        assert any("neural" in row["content"] for row in rows)
 
 
 # ── Knowledge graph ───────────────────────────────────────────────────────────
@@ -156,3 +180,48 @@ class TestFeedback:
         stats = get_feedback_stats(db)
         assert stats["total"] == 0
         assert stats["avg_rating"] == 0.0
+
+
+# ── Memory pruning ────────────────────────────────────────────────────────────
+
+class TestMemoryPruning:
+    def test_prune_old_episodes(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        log_episode(db, "s", "user", "old message")
+        deleted = prune_old_episodes(db, retention_days=0)
+        assert deleted >= 1
+
+    def test_prune_keeps_recent_episodes(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        log_episode(db, "s", "user", "recent message")
+        deleted = prune_old_episodes(db, retention_days=90)
+        assert deleted == 0
+
+    def test_prune_old_feedback(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        log_feedback(db, "s", "r", rating=5)
+        deleted = prune_old_feedback(db, retention_days=0)
+        assert deleted >= 1
+
+    def test_prune_old_failures(self, tmp_path: Path) -> None:
+        from jarvis.memory.failures import log_failure
+        db = tmp_path / "jarvis.db"
+        log_failure(db, "some_tool", {}, "ERROR: test")
+        deleted = prune_old_failures(db, retention_days=0)
+        assert deleted >= 1
+
+    def test_prune_old_preferences(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        upsert_preference(db, "alice", "communication_style", "verbosity", "concise")
+        deleted = prune_old_preferences(db, retention_days=0)
+        assert deleted >= 1
+        prefs = get_preferences(db, "alice")
+        assert prefs == {}
+
+    def test_prune_keeps_recent_preferences(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        upsert_preference(db, "bob", "technical_depth", "level", "expert")
+        deleted = prune_old_preferences(db, retention_days=90)
+        assert deleted == 0
+        prefs = get_preferences(db, "bob")
+        assert "technical_depth" in prefs
