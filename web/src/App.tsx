@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import React, { useCallback, useRef, useState } from 'react'
 import { Header, type AgentMode } from './components/Header'
 import { Sidebar, type SidebarTab } from './components/Sidebar'
 import { ChatWindow } from './components/ChatWindow'
@@ -13,9 +13,34 @@ import type {
   WsServerMessage,
 } from './types'
 
-// Map tool names to team roles for the roster indicator
+class ErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: Error | null }
+> {
+  state = { error: null }
+  static getDerivedStateFromError(error: Error) { return { error } }
+  render() {
+    if (this.state.error) return (
+      <div className="flex items-center justify-center h-screen bg-jarvis-bg text-red-400">
+        <div className="text-center p-8">
+          <p className="font-bold text-base mb-2">JARVIS encountered an error</p>
+          <p className="text-xs text-gray-500 mb-4 font-mono">{(this.state.error as Error).message}</p>
+          <button
+            onClick={() => this.setState({ error: null })}
+            className="px-4 py-2 bg-cyan-500/20 text-cyan-400 rounded-md text-sm hover:bg-cyan-500/30 transition-colors"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    )
+    return this.props.children
+  }
+}
+
+// Map delegate_task agent_type values to roster role keys
 const TOOL_TO_ROLE: Record<string, string> = {
-  delegate_to_team_member: 'manager',
+  delegate_task: 'researcher',  // default; actual role comes from tool_input
 }
 
 function makeId() {
@@ -74,8 +99,8 @@ export default function App() {
 
       case 'tool_call': {
         // Light up team roster card when delegation happens
-        if (msg.tool === 'delegate_to_team_member') {
-          setActiveRoles(prev => new Set([...prev, 'manager']))
+        if (msg.tool === 'delegate_task' && msg.input?.agent_type) {
+          setActiveRoles(prev => new Set([...prev, msg.input.agent_type as string]))
         }
         setMessages(prev => {
           const streamId = streamingIdRef.current
@@ -164,7 +189,7 @@ export default function App() {
     }
   }, [])
 
-  const { connected, send } = useJarvisWS(sessionId, handleWsMessage)
+  const { connected, permanentError, resetAndReconnect, send } = useJarvisWS(sessionId, handleWsMessage)
 
   const handleSend = useCallback((text: string) => {
     setMessages(prev => [...prev, {
@@ -208,7 +233,23 @@ export default function App() {
     setNotifications(prev => prev.filter(n => n.id !== id))
   }, [])
 
+  if (permanentError) return (
+    <div className="flex items-center justify-center h-screen bg-jarvis-bg text-red-400">
+      <div className="text-center p-8">
+        <p className="font-bold text-base mb-2">Connection lost</p>
+        <p className="text-xs text-gray-500 mb-4">Could not reconnect after 10 attempts.</p>
+        <button
+          onClick={resetAndReconnect}
+          className="px-4 py-2 bg-cyan-500/20 text-cyan-400 rounded-md text-sm hover:bg-cyan-500/30 transition-colors"
+        >
+          Try again
+        </button>
+      </div>
+    </div>
+  )
+
   return (
+    <ErrorBoundary>
     <div className="flex flex-col h-screen bg-jarvis-bg overflow-hidden">
       <Header
         connected={connected}
@@ -252,5 +293,6 @@ export default function App() {
         onDismiss={dismissNotification}
       />
     </div>
+    </ErrorBoundary>
   )
 }

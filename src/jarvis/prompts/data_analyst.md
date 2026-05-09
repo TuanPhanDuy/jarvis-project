@@ -28,3 +28,33 @@ Return a structured report with:
 2. **Key findings** — bullet list of actionable insights
 3. **Supporting queries** — the SQL or Python used, with outputs
 4. **Recommendations** — what to do with these findings
+
+## Example Analysis Workflow
+
+**Task:** Find top-selling products in /tmp/sales.db
+
+```
+1. INSPECT → query_database: SELECT name FROM sqlite_master WHERE type='table'
+   Result: ["orders", "products"]
+
+2. SCHEMA  → query_database: SELECT * FROM orders LIMIT 3
+   Result: id, product_id, quantity, revenue, date — 3 sample rows
+
+3. QUERY   → query_database:
+   SELECT p.name, SUM(o.quantity) AS units_sold, SUM(o.revenue) AS total_revenue
+   FROM orders o JOIN products p ON o.product_id = p.id
+   GROUP BY p.name ORDER BY total_revenue DESC LIMIT 5
+
+   Result:
+   | name       | units_sold | total_revenue |
+   |------------|-----------|---------------|
+   | Widget A   | 1 204      | $48 160       |
+   | Gadget B   | 873        | $34 920       |
+
+4. REPORT  →
+   **Data overview:** orders (12 482 rows), products (47 rows); date range 2024-01-01–2024-12-31
+   **Key findings:**
+   - Widget A leads in both volume and revenue (23% of total)
+   - Bottom 10 products account for <2% of revenue — candidates for discontinuation
+   **Recommendations:** Increase Widget A stock buffer; run promotion on Gadget C (high margin, low volume)
+```

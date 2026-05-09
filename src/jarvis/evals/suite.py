@@ -176,4 +176,72 @@ BASELINE_SUITE: list[EvalCase] = [
         judge_rubric="Should be concise — one or two sentences maximum.",
         tags=["basics"],
     ),
+
+    # ── Analyst agent ──────────────────────────────────────────────────────────
+    EvalCase(
+        id="analyst_memory_usage",
+        prompt="What is the current memory usage of this machine? Show total, used, and available in MB.",
+        expected_contains=["MB", "total", "available"],
+        forbidden=["I cannot", "I don't have access"],
+        judge_rubric="Should use system_info tool and report numeric memory values with units.",
+        tags=["analyst"],
+    ),
+    EvalCase(
+        id="analyst_top_processes",
+        prompt="List the top 5 processes by CPU usage on this machine.",
+        expected_contains=["cpu", "pid", "%"],
+        forbidden=["I cannot", "I don't have access"],
+        judge_rubric="Should return a table or list with process name, pid, and CPU percentage.",
+        tags=["analyst"],
+    ),
+    EvalCase(
+        id="analyst_disk_space",
+        prompt="How much disk space is available on the primary partition? Report in GB.",
+        expected_contains=["GB", "disk", "free"],
+        forbidden=["I cannot", "unavailable"],
+        judge_rubric="Should call system_info and return free/total disk space with GB units.",
+        tags=["analyst"],
+    ),
+    EvalCase(
+        id="analyst_sql_schema",
+        prompt="I have a SQLite database at /tmp/test.db. Without querying it, describe how you would inspect its schema.",
+        expected_contains=["SELECT", "sqlite_master", "table"],
+        forbidden=["I cannot", "I don't know"],
+        judge_rubric="Should describe using PRAGMA or sqlite_master query to list tables and columns.",
+        tags=["analyst"],
+    ),
+
+    # ── DevOps agent ───────────────────────────────────────────────────────────
+    EvalCase(
+        id="devops_git_log",
+        prompt="Show the git log of the last 3 commits in the current repository.",
+        expected_contains=["commit", "Author"],
+        forbidden=["I cannot", "no git repository"],
+        judge_rubric="Should call git_context or run_command and return real commit hashes and messages.",
+        tags=["devops"],
+    ),
+    EvalCase(
+        id="devops_cpu_usage",
+        prompt="What is the current CPU usage percentage of this machine?",
+        expected_contains=["%"],
+        forbidden=["I cannot", "I don't have access"],
+        judge_rubric="Should call system_info with query='cpu' and return a numeric percentage.",
+        tags=["devops"],
+    ),
+    EvalCase(
+        id="devops_filesystem_search",
+        prompt="Find all Python files in the /tmp directory (or report that none exist).",
+        expected_contains=["/tmp"],
+        forbidden=["I cannot search"],
+        judge_rubric="Should use filesystem_search or run_command and list .py files or confirm none found.",
+        tags=["devops"],
+    ),
+    EvalCase(
+        id="devops_network_info",
+        prompt="What network interfaces are active on this machine?",
+        expected_contains=["interface", "lo", "bytes"],
+        forbidden=["I cannot", "no network information"],
+        judge_rubric="Should call system_info with query='network' and list active interfaces.",
+        tags=["devops"],
+    ),
 ]

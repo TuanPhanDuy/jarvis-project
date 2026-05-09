@@ -51,6 +51,10 @@ TOOL_RISK_MAP: dict[str, RiskLevel] = {
     # High — OS-level, external APIs with auth
     "run_command": RiskLevel.HIGH,
     "run_os_command": RiskLevel.HIGH,
+    # New plugin tools
+    "system_info": RiskLevel.SAFE,
+    "query_database": RiskLevel.LOW,
+    "manage_reminder": RiskLevel.LOW,
 }
 
 

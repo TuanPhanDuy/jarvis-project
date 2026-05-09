@@ -1,4 +1,4 @@
-import { Users, Briefcase, Code, Server, GitBranch } from 'lucide-react'
+import { Users, Search, Code, CheckCircle, BarChart2, Server } from 'lucide-react'
 
 interface TeamMember {
   role: string
@@ -10,32 +10,39 @@ interface TeamMember {
 
 const TEAM: TeamMember[] = [
   {
-    role: 'manager',
-    title: 'Project Manager',
-    icon: <Briefcase size={14} />,
-    color: 'text-purple-400 border-purple-500/30 bg-purple-500/10',
-    expertise: ['Task breakdown', 'Delegation', 'Synthesis'],
-  },
-  {
-    role: 'team_lead',
-    title: 'Team Lead',
-    icon: <GitBranch size={14} />,
-    color: 'text-yellow-400 border-yellow-500/30 bg-yellow-500/10',
-    expertise: ['Architecture', 'API contracts', 'Code review'],
-  },
-  {
-    role: 'frontend',
-    title: 'Frontend Dev',
-    icon: <Code size={14} />,
+    role: 'researcher',
+    title: 'Researcher',
+    icon: <Search size={14} />,
     color: 'text-cyan-400 border-cyan-500/30 bg-cyan-500/10',
-    expertise: ['React', 'TypeScript', 'CSS / UX'],
+    expertise: ['Web search', 'Synthesis', 'Summaries'],
   },
   {
-    role: 'backend',
-    title: 'Backend Dev',
-    icon: <Server size={14} />,
+    role: 'coder',
+    title: 'Coder',
+    icon: <Code size={14} />,
     color: 'text-green-400 border-green-500/30 bg-green-500/10',
-    expertise: ['Python', 'FastAPI', 'Databases'],
+    expertise: ['Python', 'Scripts', 'Algorithms'],
+  },
+  {
+    role: 'qa',
+    title: 'QA',
+    icon: <CheckCircle size={14} />,
+    color: 'text-yellow-400 border-yellow-500/30 bg-yellow-500/10',
+    expertise: ['Code review', 'Testing', 'Security'],
+  },
+  {
+    role: 'analyst',
+    title: 'Analyst',
+    icon: <BarChart2 size={14} />,
+    color: 'text-purple-400 border-purple-500/30 bg-purple-500/10',
+    expertise: ['SQL', 'Data analysis', 'Statistics'],
+  },
+  {
+    role: 'devops',
+    title: 'DevOps',
+    icon: <Server size={14} />,
+    color: 'text-orange-400 border-orange-500/30 bg-orange-500/10',
+    expertise: ['System info', 'Git', 'Shell'],
   },
 ]
 
@@ -56,6 +63,7 @@ export function TeamRoster({ activeRoles }: TeamRosterProps) {
           return (
             <div
               key={m.role}
+              title={m.expertise.join(' · ')}
               className={`flex items-center gap-2 px-2.5 py-1 rounded-lg border text-xs shrink-0 transition-all ${
                 isActive
                   ? m.color + ' opacity-100'
