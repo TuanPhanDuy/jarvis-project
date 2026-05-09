@@ -62,10 +62,11 @@ class BaseAgent(ABC):
 
     def get_usage_summary(self) -> dict:
         return {
-            "prompt_tokens": self._prompt_tokens,
-            "completion_tokens": self._completion_tokens,
-            "total_tokens": self._prompt_tokens + self._completion_tokens,
-            "estimated_cost_usd": 0.0,  # local model — free
+            "input_tokens": self._prompt_tokens,
+            "output_tokens": self._completion_tokens,
+            "cache_write_tokens": 0,
+            "cache_read_tokens": 0,
+            "estimated_cost_usd": 0.0,
         }
 
     def run_turn(

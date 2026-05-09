@@ -7,64 +7,56 @@ from unittest.mock import MagicMock
 import pytest
 
 
-def _make_usage_mock(
-    input_tokens: int = 10,
-    output_tokens: int = 20,
-    cache_read: int = 0,
-    cache_write: int = 0,
-) -> MagicMock:
-    usage = MagicMock()
-    usage.input_tokens = input_tokens
-    usage.output_tokens = output_tokens
-    usage.cache_read_input_tokens = cache_read
-    usage.cache_creation_input_tokens = cache_write
-    return usage
-
-
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
     return tmp_path / "jarvis.db"
 
 
 @pytest.fixture
-def mock_anthropic_client() -> MagicMock:
-    client = MagicMock()
-    response = MagicMock()
-    response.stop_reason = "end_turn"
-    response.usage = _make_usage_mock()
-    text_block = MagicMock()
-    text_block.type = "text"
-    text_block.text = "Hello from JARVIS"
-    response.content = [text_block]
-    client.messages.create.return_value = response
-    return client
+def mock_ollama(monkeypatch):
+    """Patch ollama.chat so agent turns return 'ok' without hitting a real model."""
+    class _Msg:
+        content = "ok"
+        tool_calls = None
+
+    class _Resp:
+        message = _Msg()
+        prompt_eval_count = 5
+        eval_count = 10
+
+    monkeypatch.setattr("ollama.chat", lambda **kw: _Resp())
+    return _Resp()
 
 
 @pytest.fixture
-def make_researcher(tmp_path: Path, mock_anthropic_client: MagicMock):
-    """Factory fixture — call with optional path/client overrides."""
-    from jarvis.agents.researcher import ResearcherAgent
-    from jarvis.tools.registry import build_registry
-
-    def _factory(
-        path: Path | None = None,
-        client: MagicMock | None = None,
-    ) -> ResearcherAgent:
-        reports_dir = (path or tmp_path) / "reports"
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        schemas, registry = build_registry(
-            tavily_api_key="fake-key",
-            reports_dir=reports_dir,
+def agent_factory(mock_ollama):
+    """Build any BaseAgent subclass with empty tool_schemas and tool_registry."""
+    def _build(AgentClass, model: str = "llama3.2", max_tokens: int = 512, **kwargs):
+        return AgentClass(
+            model=model,
+            max_tokens=max_tokens,
+            tool_schemas=kwargs.pop("tool_schemas", []),
+            tool_registry=kwargs.pop("tool_registry", {}),
+            **kwargs,
         )
-        return ResearcherAgent(
-            client=client or mock_anthropic_client,
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
-            tool_schemas=schemas,
-            tool_registry=registry,
-        )
+    return _build
 
-    return _factory
+
+@pytest.fixture
+def settings_override(monkeypatch, tmp_path):
+    """Patch get_settings() to return isolated config pointing at tmp_path."""
+    from jarvis.config import Settings
+
+    fake = MagicMock(spec=Settings)
+    fake.reports_dir = tmp_path / "reports"
+    fake.reports_dir.mkdir(parents=True, exist_ok=True)
+    fake.model = "llama3.2"
+    fake.max_tokens = 512
+    fake.tool_timeout_seconds = 10
+    fake.auth_enabled = False
+    monkeypatch.setattr("jarvis.config.get_settings", lambda: fake)
+    monkeypatch.setattr("jarvis.agents.base_agent.get_settings", lambda: fake, raising=False)
+    return fake
 
 
 def make_mock_response(
@@ -74,10 +66,15 @@ def make_mock_response(
     tool_id: str = "t1",
     tool_input: dict | None = None,
 ) -> MagicMock:
-    """Build a fully-configured mock Anthropic response."""
+    """Compatibility helper — builds a mock Anthropic-style response for legacy tests."""
     resp = MagicMock()
     resp.stop_reason = stop_reason
-    resp.usage = _make_usage_mock()
+    usage = MagicMock()
+    usage.input_tokens = 10
+    usage.output_tokens = 20
+    usage.cache_read_input_tokens = 0
+    usage.cache_creation_input_tokens = 0
+    resp.usage = usage
     if stop_reason == "end_turn":
         block = MagicMock()
         block.type = "text"
@@ -91,3 +88,23 @@ def make_mock_response(
         block.input = tool_input or {}
         resp.content = [block]
     return resp
+
+
+@pytest.fixture
+def make_researcher(tmp_path: Path, mock_ollama):
+    """Factory fixture — returns a ResearcherAgent backed by the Ollama mock."""
+    from jarvis.agents.researcher import ResearcherAgent
+    from jarvis.tools.registry import build_registry
+
+    def _factory(path: Path | None = None) -> ResearcherAgent:
+        reports_dir = (path or tmp_path) / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        schemas, registry = build_registry(reports_dir=reports_dir)
+        return ResearcherAgent(
+            model="llama3.2",
+            max_tokens=1024,
+            tool_schemas=schemas,
+            tool_registry=registry,
+        )
+
+    return _factory

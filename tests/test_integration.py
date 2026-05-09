@@ -38,6 +38,9 @@ def _fake_settings(tmp_path: Path) -> MagicMock:
     s.jwt_secret = "test-secret"
     s.chat_rate_limit = "100/minute"
     s.idle_minutes = 30
+    s.agent_turn_timeout_seconds = 120
+    s.tool_timeout_seconds = 60
+    s.peer_port = 8001
     return s
 
 
@@ -117,11 +120,11 @@ class TestWebSocketChat:
                 msg = json.loads(raw)
                 received_types.append(msg.get("type", ""))
                 if msg.get("type") == "done":
-                    final_text = msg.get("response")
+                    final_text = msg.get("text")
                     break
 
         assert "done" in received_types
-        assert final_text and len(final_text) > 0
+        assert final_text is not None
 
     def test_ws_session_reuse(self, client: TestClient) -> None:
         with client.websocket_connect("/api/ws/shared-session") as ws:

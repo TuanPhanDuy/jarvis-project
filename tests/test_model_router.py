@@ -1,6 +1,10 @@
 """Unit tests for ModelRouter smart routing logic. No API keys needed."""
 from __future__ import annotations
 
+import pytest
+
+pytest.skip("ModelRouter removed — agents use Ollama directly", allow_module_level=True)
+
 from unittest.mock import MagicMock, patch
 
 from jarvis.models.router import ModelRouter, _MessagesAPI

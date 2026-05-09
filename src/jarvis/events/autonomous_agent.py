@@ -100,9 +100,12 @@ async def handle_event(
     text = result_holder[0]
     msg = WsProactive(trigger=event.event_type, text=text, severity=severity).model_dump()
 
-    for session_id, ws in list(active_websockets.items()):
+    event_session = getattr(event, "session_id", None) or None
+    for sid, ws in list(active_websockets.items()):
+        if event_session is not None and sid != event_session:
+            continue
         try:
             await ws.send_json(msg)
-            log.info("proactive_push_sent", session_id=session_id, trigger=event.event_type)
+            log.info("proactive_push_sent", session_id=sid, trigger=event.event_type)
         except Exception:
             pass

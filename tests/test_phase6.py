@@ -21,23 +21,20 @@ class TestToolTimeout:
 
         reports_dir = tmp_path / "reports"
         reports_dir.mkdir()
-        schemas, registry = build_registry(tavily_api_key="fake", reports_dir=reports_dir)
+        schemas, registry = build_registry(reports_dir=reports_dir)
 
-        # Inject a slow tool
+        # Inject a slow tool (sleeps past the 1-second timeout set below)
         def _slow(_input: dict) -> str:
-            time.sleep(999)
+            time.sleep(5)
             return "should not reach here"
 
-        registry["slow_tool"] = _slow
-
-        client = MagicMock()
         agent = ResearcherAgent(
-            client=client,
             model="claude-sonnet-4-6",
             max_tokens=1024,
             tool_schemas=schemas,
             tool_registry=registry,
         )
+        agent._tool_registry["slow_tool"] = _slow
 
         with patch("jarvis.config.get_settings") as mock_settings:
             s = MagicMock()
@@ -55,14 +52,13 @@ class TestToolTimeout:
 
         reports_dir = tmp_path / "reports"
         reports_dir.mkdir()
-        schemas, registry = build_registry(tavily_api_key="fake", reports_dir=reports_dir)
-        registry["fast_tool"] = lambda _: "done"
+        schemas, registry = build_registry(reports_dir=reports_dir)
 
-        client = MagicMock()
         agent = ResearcherAgent(
-            client=client, model="m", max_tokens=100,
+            model="m", max_tokens=100,
             tool_schemas=schemas, tool_registry=registry,
         )
+        agent._tool_registry["fast_tool"] = lambda _: "done"
 
         with patch("jarvis.config.get_settings") as mock_settings:
             s = MagicMock()
@@ -79,10 +75,9 @@ class TestToolTimeout:
 
         reports_dir = tmp_path / "reports"
         reports_dir.mkdir()
-        schemas, registry = build_registry(tavily_api_key="fake", reports_dir=reports_dir)
-        client = MagicMock()
+        schemas, registry = build_registry(reports_dir=reports_dir)
         agent = ResearcherAgent(
-            client=client, model="m", max_tokens=100,
+            model="m", max_tokens=100,
             tool_schemas=schemas, tool_registry=registry,
         )
         result = agent._dispatch("nonexistent_tool", {})
@@ -128,14 +123,13 @@ class TestToolMetrics:
 
         reports_dir = tmp_path / "reports"
         reports_dir.mkdir()
-        schemas, registry = build_registry(tavily_api_key="fake", reports_dir=reports_dir)
-        registry["metric_tool"] = lambda _: "ok"
+        schemas, registry = build_registry(reports_dir=reports_dir)
 
-        client = MagicMock()
         agent = ResearcherAgent(
-            client=client, model="m", max_tokens=100,
+            model="m", max_tokens=100,
             tool_schemas=schemas, tool_registry=registry,
         )
+        agent._tool_registry["metric_tool"] = lambda _: "ok"
 
         recorded: list[tuple] = []
 
