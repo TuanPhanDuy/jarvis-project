@@ -143,6 +143,8 @@ class ExecutorAgent:
 
     def _run_step(self, agent_type: str, task: str) -> str:
         from jarvis.agents.coder import CoderAgent
+        from jarvis.agents.data_analyst import DataAnalystAgent
+        from jarvis.agents.devops import DevOpsAgent
         from jarvis.agents.qa import QAAgent
         from jarvis.agents.researcher import ResearcherAgent
 
@@ -150,6 +152,8 @@ class ExecutorAgent:
             "researcher": ResearcherAgent,
             "coder": CoderAgent,
             "qa": QAAgent,
+            "analyst": DataAnalystAgent,
+            "devops": DevOpsAgent,
         }
         AgentClass = agent_classes.get(agent_type)
         if AgentClass is None:

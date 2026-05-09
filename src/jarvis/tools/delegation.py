@@ -24,6 +24,8 @@ def build_delegation_handler(
             return "ERROR: 'task' is required"
 
         from jarvis.agents.coder import CoderAgent
+        from jarvis.agents.data_analyst import DataAnalystAgent
+        from jarvis.agents.devops import DevOpsAgent
         from jarvis.agents.qa import QAAgent
         from jarvis.agents.researcher import ResearcherAgent
 
@@ -31,6 +33,8 @@ def build_delegation_handler(
             "researcher": ResearcherAgent,
             "coder": CoderAgent,
             "qa": QAAgent,
+            "analyst": DataAnalystAgent,
+            "devops": DevOpsAgent,
         }
 
         AgentClass = agent_classes.get(agent_type)
@@ -61,14 +65,16 @@ SCHEMA: dict = {
         "Delegate a task to a specialist sub-agent and receive its result. "
         "- 'researcher': web research, information gathering, topic synthesis\n"
         "- 'coder': write, run, and explain code\n"
-        "- 'qa': review code for bugs, edge cases, and quality"
+        "- 'qa': review code for bugs, edge cases, and quality\n"
+        "- 'analyst': query databases/CSV, data analysis, statistics, charts\n"
+        "- 'devops': system diagnostics, shell automation, git, infrastructure"
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "agent_type": {
                 "type": "string",
-                "enum": ["researcher", "coder", "qa"],
+                "enum": ["researcher", "coder", "qa", "analyst", "devops"],
                 "description": "Which specialist to delegate to.",
             },
             "task": {

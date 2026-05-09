@@ -1,4 +1,4 @@
-"""CoderAgent — writes, runs, and explains code."""
+"""DevOpsAgent — system diagnostics, shell commands, and infrastructure tasks."""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -6,18 +6,18 @@ from collections.abc import Callable
 from jarvis.agents.base_agent import BaseAgent
 from jarvis.prompts.loader import load_prompt
 
-_CODER_TOOLS = {
-    "execute_python", "run_command",
-    "git_context", "filesystem_search",
-    "database_query", "query_database",
-    "analyze_text",
+_DEVOPS_TOOLS = {
+    "system_info",
+    "run_command",
+    "git_context",
+    "filesystem_search",
     "save_report", "update_report",
-    "search_memory", "query_knowledge_graph",
-    "ingest_document",
+    "search_memory",
+    "query_database",
 }
 
 
-class CoderAgent(BaseAgent):
+class DevOpsAgent(BaseAgent):
     def __init__(
         self,
         model: str,
@@ -28,12 +28,12 @@ class CoderAgent(BaseAgent):
         session_id: str = "",
         user_id: str | None = None,
     ) -> None:
-        filtered_schemas = [s for s in tool_schemas if s.get("name") in _CODER_TOOLS]
-        filtered_registry = {k: v for k, v in tool_registry.items() if k in _CODER_TOOLS}
+        filtered_schemas = [s for s in tool_schemas if s.get("name") in _DEVOPS_TOOLS]
+        filtered_registry = {k: v for k, v in tool_registry.items() if k in _DEVOPS_TOOLS}
         super().__init__(
             model, max_tokens, filtered_schemas, filtered_registry,
             approval_gate=approval_gate, session_id=session_id, user_id=user_id,
         )
 
     def get_system_prompt(self) -> str:
-        return load_prompt("coder")
+        return load_prompt("devops")

@@ -5,6 +5,14 @@ from collections.abc import Callable
 from jarvis.agents.base_agent import BaseAgent
 from jarvis.prompts.loader import load_prompt
 
+_RESEARCHER_TOOLS = {
+    "web_search", "read_url", "browse",
+    "search_memory", "search_episodic_memory", "query_knowledge_graph",
+    "analyze_text", "summarize_youtube",
+    "save_report", "update_report",
+    "filesystem_search",
+}
+
 
 class ResearcherAgent(BaseAgent):
     def __init__(
@@ -18,8 +26,10 @@ class ResearcherAgent(BaseAgent):
         session_id: str = "",
         user_id: str | None = None,
     ) -> None:
+        filtered_schemas = [s for s in tool_schemas if s.get("name") in _RESEARCHER_TOOLS]
+        filtered_registry = {k: v for k, v in tool_registry.items() if k in _RESEARCHER_TOOLS}
         super().__init__(
-            model, max_tokens, tool_schemas, tool_registry,
+            model, max_tokens, filtered_schemas, filtered_registry,
             approval_gate=approval_gate, session_id=session_id, user_id=user_id,
         )
         self._max_search_calls = max_search_calls

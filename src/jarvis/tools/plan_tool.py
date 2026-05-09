@@ -75,7 +75,7 @@ SCHEMA: dict = {
                     "properties": {
                         "id": {"type": "string", "description": "Unique step id (e.g. 'research', 'code', 'review')."},
                         "description": {"type": "string", "description": "Self-contained task for this step."},
-                        "agent_type": {"type": "string", "enum": ["researcher", "coder", "qa"]},
+                        "agent_type": {"type": "string", "enum": ["researcher", "coder", "qa", "analyst", "devops"]},
                         "depends_on": {"type": "array", "items": {"type": "string"}, "default": []},
                     },
                     "required": ["id", "description", "agent_type"],
