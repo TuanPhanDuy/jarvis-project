@@ -30,6 +30,9 @@ test:
 test-cov:
 	uv run pytest tests/ --cov=jarvis --cov-report=term-missing --cov-report=html
 
+coverage-check:
+	uv run pytest tests/ --cov=src/jarvis --cov-report=term-missing --cov-fail-under=40
+
 test-fast:
 	uv run pytest tests/ -x -q
 
