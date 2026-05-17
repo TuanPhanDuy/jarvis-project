@@ -10,6 +10,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import structlog
+from jarvis.config import get_settings
+from jarvis.training.crawler import ResearchCrawler
+from jarvis.training.tracking import (
+    complete_run,
+    count_new_docs_since,
+    get_last_run,
+    start_run,
+)
 
 log = structlog.get_logger()
 
@@ -52,6 +60,111 @@ def _monitor_job(query: str, session_id: str, rabbitmq_url: str, queue_name: str
         log.info("scheduled_monitor_published", query=query)
     except Exception as exc:
         log.error("scheduled_monitor_failed", query=query, error=str(exc))
+
+
+def _auto_crawl_job(db_path_str: str, reports_dir_str: str) -> None:
+    """Scheduled job: crawl AI research from the internet and index into ChromaDB."""
+    try:
+        from pathlib import Path
+
+        settings = get_settings()
+        db_path = Path(db_path_str)
+        reports_dir = Path(reports_dir_str)
+        run_id = start_run(db_path, "crawl")
+
+        crawler = ResearchCrawler(reports_dir)
+        topics = [t.strip() for t in settings.auto_training_topics.split(",")]
+        max_n = settings.training_max_papers_per_source
+        total = 0
+
+        for topic in topics:
+            for fetch_fn, kwargs in [
+                (crawler.crawl_arxiv, {"topic": topic, "max_results": max_n}),
+                (crawler.crawl_hf_blog, {"max_posts": max_n}),
+                (crawler.crawl_anthropic, {"max_posts": max_n}),
+                (crawler.crawl_papers_with_code, {"topic": topic, "max_results": max_n}),
+            ]:
+                docs = fetch_fn(**kwargs)
+                names = crawler.ingest_all(docs)
+                total += len([n for n in names if not n.startswith("ERROR")])
+
+        complete_run(db_path, run_id, docs_crawled=total,
+                     notes=f"topics: {settings.auto_training_topics}")
+        log.info("auto_crawl_complete", docs=total)
+    except Exception as exc:
+        log.error("auto_crawl_failed", error=str(exc))
+        try:
+            from pathlib import Path
+            if run_id >= 0:
+                complete_run(Path(db_path_str), run_id, status="failed", notes=str(exc))
+        except Exception:
+            pass
+
+
+def _auto_finetune_job(db_path_str: str, reports_dir_str: str) -> None:
+    """Scheduled job: generate training data and fine-tune the model if enough new docs exist."""
+    run_id: int = -1
+    try:
+        from pathlib import Path
+        from jarvis.training.data_generator import TrainingDataGenerator
+        from jarvis.training.dataset_manager import DatasetManager
+        from jarvis.training.finetune import Finetuner
+        from jarvis.training.modelfile import register_model
+
+        settings = get_settings()
+        if not settings.anthropic_api_key:
+            log.warning("auto_finetune_skipped", reason="ANTHROPIC_API_KEY not set")
+            return
+
+        db_path = Path(db_path_str)
+        reports_dir = Path(reports_dir_str)
+        data_dir = Path(settings.training_data_dir)
+
+        last_ft = get_last_run(db_path, "finetune")
+        since_ts = last_ft.completed_at if last_ft else 0.0
+        new_docs = count_new_docs_since(db_path, since_ts, reports_dir)
+
+        if new_docs < settings.auto_training_min_new_docs:
+            log.info("auto_finetune_skipped", new_docs=new_docs,
+                     min_required=settings.auto_training_min_new_docs)
+            return
+
+        run_id = start_run(db_path, "finetune")
+
+        gen = TrainingDataGenerator(reports_dir, api_key=settings.anthropic_api_key)
+        dataset_path = data_dir / "dataset.jsonl"
+        pairs = gen.run(dataset_path, target_pairs=settings.training_target_pairs)
+
+        dm = DatasetManager()
+        dm.deduplicate(dataset_path)
+        train_path, val_path = dm.split(dataset_path)
+
+        adapter_dir = data_dir / "adapters"
+        ft = Finetuner(base_model=settings.training_base_model_mlx, adapter_dir=adapter_dir)
+        ft.train(data_dir, epochs=settings.training_lora_epochs,
+                 lora_rank=settings.training_lora_rank)
+
+        model_name = settings.auto_training_model_name
+        gguf_path = data_dir / f"{model_name}.gguf"
+        ft.export_gguf(gguf_path)
+        registered = register_model(gguf_path, model_name)
+
+        complete_run(
+            db_path, run_id,
+            docs_crawled=new_docs,
+            pairs_generated=pairs,
+            model_name=model_name if registered else "",
+            notes="auto-finetune" + ("" if registered else " (registration failed)"),
+        )
+        log.info("auto_finetune_complete", model=model_name, pairs=pairs)
+    except Exception as exc:
+        log.error("auto_finetune_failed", error=str(exc))
+        try:
+            from pathlib import Path
+            if run_id >= 0:
+                complete_run(Path(db_path_str), run_id, status="failed", notes=str(exc))
+        except Exception:
+            pass
 
 
 def _graph_dedup_job(db_path_str: str) -> None:
@@ -252,6 +365,53 @@ def _add_builtin_jobs(scheduler, db_path: Path, reports_dir: Path) -> None:
             scheduler.add_job(func, trigger, args=args, id=job_id, misfire_grace_time=3600)
             log.info("builtin_job_registered", job_id=job_id)
 
+    _register_auto_training_jobs(scheduler, db_path, reports_dir)
+
+
+def _parse_cron(expr: str) -> "CronTrigger":
+    """Parse a 5-field cron expression (min hour dom month dow) into a CronTrigger."""
+    from apscheduler.triggers.cron import CronTrigger
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        raise ValueError(f"Invalid cron expression (expected 5 fields): {expr!r}")
+    minute, hour, day, month, day_of_week = parts
+    return CronTrigger(
+        minute=minute, hour=hour, day=day, month=month,
+        day_of_week=day_of_week, timezone="UTC",
+    )
+
+
+def _register_auto_training_jobs(scheduler, db_path: Path, reports_dir: Path) -> None:
+    """Register auto-crawl and auto-finetune jobs if JARVIS_AUTO_TRAINING=true."""
+    try:
+        settings = get_settings()
+        if not settings.auto_training_enabled:
+            return
+
+        crawl_trigger = _parse_cron(settings.auto_crawl_cron)
+        if not scheduler.get_job("builtin_auto_crawl"):
+            scheduler.add_job(
+                _auto_crawl_job,
+                crawl_trigger,
+                args=[str(db_path), str(reports_dir)],
+                id="builtin_auto_crawl",
+                misfire_grace_time=3600,
+            )
+            log.info("auto_crawl_job_registered", cron=settings.auto_crawl_cron)
+
+        ft_trigger = _parse_cron(settings.auto_finetune_cron)
+        if not scheduler.get_job("builtin_auto_finetune"):
+            scheduler.add_job(
+                _auto_finetune_job,
+                ft_trigger,
+                args=[str(db_path), str(reports_dir)],
+                id="builtin_auto_finetune",
+                misfire_grace_time=7200,
+            )
+            log.info("auto_finetune_job_registered", cron=settings.auto_finetune_cron)
+    except Exception as exc:
+        log.error("auto_training_job_registration_failed", error=str(exc))
+
 
 def start_scheduler(db_path: Path):
     """Start the background scheduler with a persistent SQLite job store."""
@@ -294,4 +454,6 @@ JOB_FUNCTIONS = {
     "code_review": _code_review_job,
     "pipeline": _pipeline_job,
     "graph_dedup": _graph_dedup_job,
+    "auto_crawl": _auto_crawl_job,
+    "auto_finetune": _auto_finetune_job,
 }

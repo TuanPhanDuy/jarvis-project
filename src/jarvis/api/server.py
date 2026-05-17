@@ -1140,6 +1140,109 @@ async def get_autonomous_events(limit: int = 20) -> list[dict]:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+# ── Training pipeline API ──────────────────────────────────────────────────────
+
+@app.get("/api/training/status")
+async def get_training_status() -> dict:
+    """Return current auto-training config and last run info."""
+    settings = get_settings()
+    db_path = settings.reports_dir / "jarvis.db"
+    try:
+        from jarvis.training.tracking import get_last_run
+        last_crawl = get_last_run(db_path, "crawl")
+        last_ft = get_last_run(db_path, "finetune")
+    except Exception:
+        last_crawl = last_ft = None
+
+    from jarvis.scheduler.core import get_scheduler
+    scheduler = get_scheduler()
+    next_crawl = next_ft = None
+    if scheduler:
+        crawl_job = scheduler.get_job("builtin_auto_crawl")
+        ft_job = scheduler.get_job("builtin_auto_finetune")
+        if crawl_job and crawl_job.next_run_time:
+            next_crawl = crawl_job.next_run_time.isoformat()
+        if ft_job and ft_job.next_run_time:
+            next_ft = ft_job.next_run_time.isoformat()
+
+    return {
+        "auto_training_enabled": settings.auto_training_enabled,
+        "topics": settings.auto_training_topics,
+        "crawl_cron": settings.auto_crawl_cron,
+        "finetune_cron": settings.auto_finetune_cron,
+        "model_name": settings.auto_training_model_name,
+        "min_new_docs": settings.auto_training_min_new_docs,
+        "next_crawl": next_crawl,
+        "next_finetune": next_ft,
+        "last_crawl": {
+            "status": last_crawl.status,
+            "completed_at": last_crawl.completed_at,
+            "docs_crawled": last_crawl.docs_crawled,
+        } if last_crawl else None,
+        "last_finetune": {
+            "status": last_ft.status,
+            "completed_at": last_ft.completed_at,
+            "pairs_generated": last_ft.pairs_generated,
+            "model_name": last_ft.model_name,
+        } if last_ft else None,
+    }
+
+
+@app.get("/api/training/history")
+async def get_training_history(limit: int = 20) -> list[dict]:
+    """Return recent training run records."""
+    db_path = get_settings().reports_dir / "jarvis.db"
+    try:
+        from jarvis.training.tracking import get_history
+        runs = get_history(db_path, limit=limit)
+        return [
+            {
+                "id": r.id, "run_type": r.run_type, "status": r.status,
+                "started_at": r.started_at, "completed_at": r.completed_at,
+                "docs_crawled": r.docs_crawled, "pairs_generated": r.pairs_generated,
+                "model_name": r.model_name, "notes": r.notes,
+            }
+            for r in runs
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/training/crawl")
+async def trigger_crawl(background_tasks) -> dict:
+    """Trigger an immediate research crawl in the background."""
+    settings = get_settings()
+    db_path = settings.reports_dir / "jarvis.db"
+    reports_dir = settings.reports_dir
+
+    def _run():
+        from jarvis.scheduler.core import _auto_crawl_job
+        _auto_crawl_job(str(db_path), str(reports_dir))
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(_executor, _run)
+    return {"status": "crawl started", "topics": settings.auto_training_topics}
+
+
+@app.post("/api/training/finetune")
+async def trigger_finetune() -> dict:
+    """Trigger an immediate fine-tuning run in the background."""
+    settings = get_settings()
+    db_path = settings.reports_dir / "jarvis.db"
+    reports_dir = settings.reports_dir
+
+    if not settings.anthropic_api_key:
+        raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY not configured")
+
+    def _run():
+        from jarvis.scheduler.core import _auto_finetune_job
+        _auto_finetune_job(str(db_path), str(reports_dir))
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(_executor, _run)
+    return {"status": "finetune started", "model_name": settings.auto_training_model_name}
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:

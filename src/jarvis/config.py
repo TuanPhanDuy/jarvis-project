@@ -105,6 +105,17 @@ class Settings(BaseSettings):
     training_lora_epochs: int = Field(3, alias="JARVIS_TRAINING_EPOCHS")
     training_target_pairs: int = Field(500, alias="JARVIS_TRAINING_TARGET_PAIRS")
 
+    # Auto-training schedule
+    auto_training_enabled: bool = Field(False, alias="JARVIS_AUTO_TRAINING")
+    auto_training_topics: str = Field(
+        "RLHF,transformers,constitutional AI,multimodal systems,memory systems",
+        alias="JARVIS_TRAINING_TOPICS",
+    )
+    auto_crawl_cron: str = Field("0 1 * * *", alias="JARVIS_AUTO_CRAWL_CRON")    # daily 01:00 UTC
+    auto_finetune_cron: str = Field("0 3 * * 0", alias="JARVIS_AUTO_FINETUNE_CRON")  # Sunday 03:00 UTC
+    auto_training_model_name: str = Field("jarvis-ft", alias="JARVIS_FT_MODEL_NAME")
+    auto_training_min_new_docs: int = Field(5, alias="JARVIS_TRAINING_MIN_NEW_DOCS")
+
     model_config = {"populate_by_name": True}
 
     @field_validator("max_tokens")
