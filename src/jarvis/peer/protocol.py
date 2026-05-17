@@ -10,21 +10,39 @@ Delta format (from edge/sync.py):
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import structlog
 
 log = structlog.get_logger()
 
+_RETRY_DELAYS = (1.0, 2.0, 4.0)  # seconds between attempts (3 total attempts)
+
+
+def _with_retry(fn, host: str, port: int, label: str):
+    """Call fn(), retrying with exponential backoff on exception. Re-raises after all attempts."""
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            log.warning(f"peer_{label}_attempt_failed", host=host, port=port,
+                        attempt=attempt, error=str(exc))
+            if delay is not None:
+                time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
 
 def push_delta(peer_host: str, peer_port: int, delta: dict, timeout: float = 10.0) -> bool:
-    """POST our graph delta to a peer. Returns True on success."""
-    try:
-        import urllib.request
-        import urllib.error
+    """POST our graph delta to a peer. Returns True on success, False after all retries fail."""
+    import urllib.request
 
-        url = f"http://{peer_host}:{peer_port}/api/peer/sync"
-        body = json.dumps(delta).encode()
+    url = f"http://{peer_host}:{peer_port}/api/peer/sync"
+    body = json.dumps(delta).encode()
+
+    def _do_push() -> bool:
         req = urllib.request.Request(
             url,
             data=body,
@@ -33,6 +51,9 @@ def push_delta(peer_host: str, peer_port: int, delta: dict, timeout: float = 10.
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
+
+    try:
+        return _with_retry(_do_push, peer_host, peer_port, "push")
     except Exception as exc:
         log.warning("peer_push_failed", host=peer_host, port=peer_port, error=str(exc))
         return False
@@ -45,16 +66,19 @@ def merge_incoming_delta(delta: dict, db_path: Path) -> int:
 
 
 def pull_delta(peer_host: str, peer_port: int, since_ts: float = 0.0, timeout: float = 10.0) -> dict | None:
-    """GET graph delta from a peer since `since_ts`. Returns delta dict or None on failure."""
-    try:
-        import urllib.parse
-        import urllib.request
+    """GET graph delta from a peer since `since_ts`. Returns delta dict or None after all retries fail."""
+    import urllib.parse
+    import urllib.request
 
-        params = urllib.parse.urlencode({"since_ts": since_ts})
-        url = f"http://{peer_host}:{peer_port}/api/peer/delta?{params}"
+    params = urllib.parse.urlencode({"since_ts": since_ts})
+    url = f"http://{peer_host}:{peer_port}/api/peer/delta?{params}"
+
+    def _do_pull() -> dict:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
-            import json as _json
-            return _json.loads(resp.read())
+            return json.loads(resp.read())
+
+    try:
+        return _with_retry(_do_pull, peer_host, peer_port, "pull")
     except Exception as exc:
         log.warning("peer_pull_failed", host=peer_host, port=peer_port, error=str(exc))
         return None

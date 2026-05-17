@@ -18,6 +18,7 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -92,27 +93,8 @@ _session_activity: dict[str, float] = {}
 
 # ── App factory ───────────────────────────────────────────────────────────────
 
-app = FastAPI(
-    title="JARVIS API",
-    description="Just A Rather Very Intelligent System — powered by Claude",
-    version="0.1.0",
-)
-
-import os as _os
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_os.getenv("JARVIS_CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-_require_auth = None  # set in startup; callable FastAPI dependency
-_limiter = None  # slowapi Limiter, set in startup if rate_limit_enabled
-
-
-@app.on_event("startup")
-async def startup() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global _require_auth
     settings = get_settings()
     _pre_index_reports(settings)
@@ -153,13 +135,32 @@ async def startup() -> None:
     if settings.peer_enabled:
         await _start_peer_coordinator(settings)
 
+    yield
 
-@app.on_event("shutdown")
-async def shutdown() -> None:
     from jarvis.scheduler.core import stop_scheduler
     stop_scheduler()
     from jarvis.events.bus import get_event_bus
     await get_event_bus().shutdown()
+
+
+app = FastAPI(
+    title="JARVIS API",
+    description="Just A Rather Very Intelligent System — powered by Claude",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+import os as _os
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_os.getenv("JARVIS_CORS_ORIGINS", "*").split(","),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+_require_auth = None  # set in lifespan; callable FastAPI dependency
+_limiter = None  # slowapi Limiter, set in lifespan if rate_limit_enabled
 
 
 async def _start_event_bus(settings) -> None:

@@ -201,12 +201,41 @@ class BaseAgent(ABC):
         except Exception:
             pass
 
+    def _surface_memory_context(self, messages: list[dict]) -> list[dict]:
+        """Prepend relevant prior context to the last user message when proactive_memory is on."""
+        if not self._settings_flag("proactive_memory_enabled", False):
+            return messages
+        last_user = next(
+            (m for m in reversed(messages) if m.get("role") == "user"),
+            None,
+        )
+        if not last_user:
+            return messages
+        query = str(last_user.get("content", ""))
+        try:
+            from jarvis.memory.surfacing import surface_memory
+            from jarvis.config import get_settings
+            db_path = get_settings().reports_dir / "jarvis.db"
+            ctx = surface_memory(query, db_path, user_id=self._user_id)
+        except Exception:
+            return messages
+        if not ctx:
+            return messages
+        patched = list(messages)
+        idx = next(
+            i for i in range(len(patched) - 1, -1, -1)
+            if patched[i].get("role") == "user"
+        )
+        patched[idx] = dict(patched[idx], content=f"[Prior context]\n{ctx}\n\n{query}")
+        return patched
+
     def _run_turn_inner(
         self,
         messages: list[dict],
         on_chunk: Callable[[str], None] | None = None,
     ) -> tuple[str, list[dict]]:
         messages = self._compress_history(messages)
+        messages = self._surface_memory_context(messages)
         system = self.get_system_prompt()
         coaching = self._coaching_prefix()
         if coaching:
