@@ -873,6 +873,29 @@ async def get_audit(
     return get_recent_audit(db_path, limit=limit, offset=offset, session_id=session_id)
 
 
+@app.get("/api/turns")
+async def get_agent_turns(
+    limit: int = 50, session_id: str | None = None
+) -> list[dict]:
+    """Return recent per-agent-turn records (tokens, latency, model, tool calls)."""
+    from jarvis.memory.turns import get_turn_stats
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_turn_stats(db_path, session_id=session_id, limit=limit)
+
+
+@app.get("/api/analytics/agents")
+async def get_agent_analytics(
+    agent_type: str | None = None,
+    hours: float = 24,
+) -> list[dict]:
+    """Return per-agent performance stats: latency percentiles, token usage, call counts."""
+    import time
+    from jarvis.memory.analytics import get_agent_performance
+    db_path = get_settings().reports_dir / "jarvis.db"
+    since_ts = time.time() - hours * 3600
+    return get_agent_performance(db_path, agent_type=agent_type, since_ts=since_ts)
+
+
 @app.get("/api/approval/pending")
 async def get_pending_approvals(session_id: str) -> list[dict]:
     """Return pending approval requests for a session."""
@@ -951,6 +974,16 @@ async def receive_peer_sync(request: Request) -> dict:
     except Exception as exc:
         log.error("peer_sync_receive_error", error=str(exc))
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/peer/delta")
+async def get_peer_delta(since_ts: float = 0.0) -> dict:
+    """Serve local graph delta to a requesting peer (since the given timestamp)."""
+    from jarvis.edge.sync import export_delta
+
+    settings = get_settings()
+    db_path = settings.reports_dir / "jarvis.db"
+    return export_delta(db_path, since_ts=since_ts)
 
 
 # ── Reports endpoints ──────────────────────────────────────────────────────────

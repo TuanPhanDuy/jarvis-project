@@ -42,6 +42,11 @@ def load_plugins() -> tuple[list[dict], dict[str, callable]]:
                 log.warning("plugin_skipped", plugin=module_info.name, reason="missing SCHEMA or handle")
                 continue
             tool_name = module.SCHEMA["name"]
+            _required = {"name", "description", "input_schema"}
+            missing = _required - set(module.SCHEMA.keys())
+            if missing:
+                log.warning("plugin_schema_invalid", plugin=module_info.name, missing=sorted(missing))
+                continue
             if tool_name in registry:
                 log.warning(
                     "plugin_name_collision",

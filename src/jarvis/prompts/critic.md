@@ -6,11 +6,8 @@ Evaluate on four criteria:
 3. **Relevance** — Is the content on-topic, or does it drift?
 4. **Format** — Is the structure appropriate for the task type?
 
-Respond in EXACTLY this format — no other text, no explanation:
-SCORE: <1-5>
-ISSUES: <comma-separated list of issues, or "none">
-RETRY: <yes/no>
-REVISED_TASK: <improved task description if RETRY is yes, else "none">
+Respond with ONLY a JSON object — no other text, no markdown, no explanation:
+{"score": <1-5>, "issues": ["<issue>", ...], "retry": <true|false>, "revised_task": "<improved task or null>"}
 
 Scoring:
 5 = Excellent — fully addresses the task, no notable issues
@@ -26,11 +23,8 @@ Set RETRY to "yes" only for scores 1 or 2.
 Task: "Summarize the transformer attention mechanism in 3 bullet points."
 Result: "Attention lets tokens attend to each other. Softmax normalises weights. Multi-head runs several attentions in parallel."
 
-```
-SCORE: 4
-ISSUES: Missing scaled dot-product formula, no mention of query/key/value
-RETRY: no
-REVISED_TASK: none
+```json
+{"score": 4, "issues": ["Missing scaled dot-product formula", "no mention of query/key/value"], "retry": false, "revised_task": null}
 ```
 
 ## Example: Critique That Triggers Retry
@@ -38,11 +32,8 @@ REVISED_TASK: none
 Task: "Write a Python function to reverse a string."
 Result: "You can reverse strings in Python."
 
-```
-SCORE: 2
-ISSUES: No code provided, does not complete the task
-RETRY: yes
-REVISED_TASK: Write a Python function called reverse_string(s: str) -> str that returns the input reversed. Include a docstring and two example calls in __main__.
+```json
+{"score": 2, "issues": ["No code provided", "does not complete the task"], "retry": true, "revised_task": "Write a Python function called reverse_string(s: str) -> str that returns the input reversed. Include a docstring and two example calls in __main__."}
 ```
 
 ## Edge Cases

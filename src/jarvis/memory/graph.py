@@ -105,29 +105,85 @@ def handle_update_knowledge_graph(tool_input: dict, db_path: Path) -> str:
         return f"ERROR: update_knowledge_graph failed — {e}"
 
 
+def _bfs_subgraph(
+    conn: sqlite3.Connection,
+    seed_entity: str,
+    depth: int,
+    relation_filter: str | None,
+) -> tuple[set[str], list]:
+    """BFS from seed entity up to `depth` hops. Returns (visited_names, rel_rows)."""
+    seed_rows = conn.execute(
+        "SELECT name FROM entities WHERE name LIKE ? LIMIT 10",
+        (f"%{seed_entity}%",),
+    ).fetchall()
+    frontier = {r["name"] for r in seed_rows} or {seed_entity}
+    visited: set[str] = set(frontier)
+    seen_rels: set[tuple] = set()
+    all_rels: list = []
+
+    for _ in range(depth):
+        if not frontier or len(visited) > 50:
+            break
+        placeholders = ",".join("?" * len(frontier))
+        args: list = list(frontier) + list(frontier)
+        if relation_filter:
+            sql = (
+                f"SELECT * FROM relationships "
+                f"WHERE (from_entity IN ({placeholders}) OR to_entity IN ({placeholders})) "
+                f"AND relation = ?"
+            )
+            args.append(relation_filter)
+        else:
+            sql = (
+                f"SELECT * FROM relationships "
+                f"WHERE from_entity IN ({placeholders}) OR to_entity IN ({placeholders})"
+            )
+        rels = conn.execute(sql, args).fetchall()
+
+        new_frontier: set[str] = set()
+        for r in rels:
+            key = (r["from_entity"], r["relation"], r["to_entity"])
+            if key not in seen_rels:
+                seen_rels.add(key)
+                all_rels.append(r)
+            for name in (r["from_entity"], r["to_entity"]):
+                if name not in visited:
+                    new_frontier.add(name)
+                    visited.add(name)
+        frontier = new_frontier
+
+    return visited, all_rels
+
+
 def handle_query_knowledge_graph(tool_input: dict, db_path: Path) -> str:
     try:
         entity = tool_input.get("entity", "").strip()
         if not entity:
             return "ERROR: entity name is required."
 
+        depth = min(max(int(tool_input.get("depth", 1)), 1), 3)
+        relation_filter = tool_input.get("relation_filter", None) or None
+
         conn = _get_conn(db_path)
 
-        # Look up the entity
         ent_row = conn.execute(
             "SELECT * FROM entities WHERE name LIKE ? ORDER BY name LIMIT 1", (f"%{entity}%",)
         ).fetchone()
 
-        # Find all relationships involving this entity
-        rels = conn.execute(
-            """
-            SELECT * FROM relationships
-            WHERE from_entity LIKE ? OR to_entity LIKE ?
-            ORDER BY from_entity, relation
-            LIMIT 50
-            """,
-            (f"%{entity}%", f"%{entity}%"),
-        ).fetchall()
+        if depth == 1 and not relation_filter:
+            rels = conn.execute(
+                """
+                SELECT * FROM relationships
+                WHERE from_entity LIKE ? OR to_entity LIKE ?
+                ORDER BY from_entity, relation
+                LIMIT 50
+                """,
+                (f"%{entity}%", f"%{entity}%"),
+            ).fetchall()
+            visited: set[str] = set()
+        else:
+            visited, rels = _bfs_subgraph(conn, entity, depth, relation_filter)
+
         conn.close()
 
         if not ent_row and not rels:
@@ -140,11 +196,14 @@ def handle_query_knowledge_graph(tool_input: dict, db_path: Path) -> str:
                 lines.append(ent_row["description"])
             lines.append("")
 
-        if rels:
+        if depth > 1 and rels:
+            lines.append(f"Subgraph (depth={depth}, {len(visited)} entities, {len(rels)} relationships):")
+        elif rels:
             lines.append(f"Relationships ({len(rels)}):")
-            for r in rels:
-                note = f"  # {r['notes']}" if r["notes"] else ""
-                lines.append(f"  {r['from_entity']} --[{r['relation']}]--> {r['to_entity']}{note}")
+
+        for r in rels:
+            note = f"  # {r['notes']}" if r["notes"] else ""
+            lines.append(f"  {r['from_entity']} --[{r['relation']}]--> {r['to_entity']}{note}")
 
         return "\n".join(lines)
     except Exception as e:
@@ -193,11 +252,26 @@ UPDATE_SCHEMA: dict = {
     },
 }
 
+def get_recent_entities(db_path: Path, user_id: str = "shared", limit: int = 20) -> list[str]:
+    """Return the names of the most recently added entities in the knowledge graph."""
+    try:
+        conn = _get_conn(db_path)
+        rows = conn.execute(
+            "SELECT name FROM entities WHERE user_id IN (?, 'shared') ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        conn.close()
+        return [r["name"] for r in rows]
+    except Exception:
+        return []
+
+
 QUERY_SCHEMA: dict = {
     "name": "query_knowledge_graph",
     "description": (
         "Query JARVIS's knowledge graph to find what is known about an entity "
-        "and its relationships to other concepts."
+        "and its relationships to other concepts. Use depth=2 or depth=3 to follow "
+        "transitive connections across multiple hops."
     ),
     "input_schema": {
         "type": "object",
@@ -205,7 +279,24 @@ QUERY_SCHEMA: dict = {
             "entity": {
                 "type": "string",
                 "description": "Entity name to look up, e.g. 'RLHF' or 'Anthropic'.",
-            }
+            },
+            "depth": {
+                "type": "integer",
+                "description": (
+                    "How many relationship hops to follow. "
+                    "1 = direct neighbors only (default). 2-3 = transitive discovery."
+                ),
+                "default": 1,
+                "minimum": 1,
+                "maximum": 3,
+            },
+            "relation_filter": {
+                "type": "string",
+                "description": (
+                    "If given, only follow edges of this relation type, e.g. 'uses' or 'improves_on'. "
+                    "Applies at all depths."
+                ),
+            },
         },
         "required": ["entity"],
     },

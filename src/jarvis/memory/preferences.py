@@ -12,9 +12,18 @@ Categories:
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
 from pathlib import Path
+
+_DECAY_LAMBDA = 0.01  # half-life ≈ 70 days
+
+
+def _effective_confidence(confidence: float, updated_at: float) -> float:
+    """Exponentially decay confidence based on age in days."""
+    days_old = (time.time() - updated_at) / 86400.0
+    return confidence * math.exp(-_DECAY_LAMBDA * days_old)
 
 
 def _get_conn(db_path: Path) -> sqlite3.Connection:
@@ -93,27 +102,68 @@ def get_preferences(db_path: Path, user_id: str) -> dict[str, dict[str, str]]:
         return {}
 
 
-def get_preference_context(db_path: Path, user_id: str) -> str:
+def get_preferences_with_metadata(db_path: Path, user_id: str) -> list[dict]:
+    """Return all preferences with full metadata including updated_at and confidence."""
+    try:
+        conn = _get_conn(db_path)
+        rows = conn.execute(
+            "SELECT category, key, value, confidence, updated_at, source "
+            "FROM user_preferences WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+_CATEGORY_LABELS = {
+    "communication_style": "Communication style",
+    "technical_depth": "Technical depth",
+    "domain_interest": "Areas of interest",
+    "schedule": "Schedule / timezone",
+    "tool_prefs": "Preferred tools / languages",
+}
+
+_MIN_EFFECTIVE_CONFIDENCE = 0.15
+_FADING_THRESHOLD = 0.30
+_FADING_AGE_DAYS = 90
+
+
+def get_preference_context(db_path: Path, user_id: str, *, decay: bool = True) -> str:
     """Return a formatted string suitable for injection into a system prompt.
 
+    When decay=True (default), applies exponential temporal decay to confidence
+    so stale preferences fade out over time (half-life ≈ 70 days).
     Returns empty string if no preferences are stored yet.
     """
-    prefs = get_preferences(db_path, user_id)
-    if not prefs:
+    rows = get_preferences_with_metadata(db_path, user_id)
+    if not rows:
         return ""
 
+    now = time.time()
+    weighted: list[tuple[float, dict]] = []
+    for row in rows:
+        if decay:
+            eff = _effective_confidence(row["confidence"], row["updated_at"])
+        else:
+            eff = row["confidence"]
+        if eff >= _MIN_EFFECTIVE_CONFIDENCE:
+            weighted.append((eff, row))
+
+    if not weighted:
+        return ""
+
+    weighted.sort(key=lambda t: t[0], reverse=True)
+
     lines = ["## What I know about you"]
-    category_labels = {
-        "communication_style": "Communication style",
-        "technical_depth": "Technical depth",
-        "domain_interest": "Areas of interest",
-        "schedule": "Schedule / timezone",
-        "tool_prefs": "Preferred tools / languages",
-    }
-    for category, kv in prefs.items():
-        label = category_labels.get(category, category.replace("_", " ").title())
-        for key, value in kv.items():
-            lines.append(f"- {label} → {key}: {value}")
+    for eff, row in weighted:
+        label = _CATEGORY_LABELS.get(row["category"], row["category"].replace("_", " ").title())
+        age_days = (now - row["updated_at"]) / 86400.0
+        fading = decay and eff < _FADING_THRESHOLD and age_days > _FADING_AGE_DAYS
+        suffix = " (fading)" if fading else ""
+        lines.append(f"- {label} → {row['key']}: {row['value']}{suffix}")
+
     return "\n".join(lines)
 
 
@@ -139,6 +189,20 @@ def save_session_summary(
         conn.close()
     except Exception:
         pass
+
+
+def get_recent_session_summaries(db_path: Path, user_id: str, limit: int = 3) -> list[str]:
+    """Return the most recent session summary strings for a user, newest first."""
+    try:
+        conn = _get_conn(db_path)
+        rows = conn.execute(
+            "SELECT summary FROM session_summaries WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        conn.close()
+        return [r["summary"] for r in rows]
+    except Exception:
+        return []
 
 
 def prune_old_preferences(db_path: Path, retention_days: int) -> int:

@@ -176,3 +176,18 @@ class TestWorkerDispatch:
 
         # Message is acked even on error (error is in result payload, not exception)
         channel.basic_ack.assert_called_once()
+
+    def test_publish_failure_nacks_message(self):
+        """If basic_publish raises, message is nacked with requeue=True instead of crashing."""
+        body = self._make_valid_task_body()
+        channel, method, properties = self._make_pika_parts(body, reply_to="rpc-q")
+        channel.basic_publish.side_effect = Exception("broker connection lost")
+        mock_result = MagicMock()
+        mock_result.model_dump_json.return_value = '{"task_id":"task-xyz"}'
+        mock_result.error = None
+
+        with patch("jarvis.queue.worker.process_task", return_value=mock_result):
+            _on_message(channel, method, properties, body)
+
+        channel.basic_nack.assert_called_once_with(delivery_tag="tag-001", requeue=True)
+        channel.basic_ack.assert_not_called()

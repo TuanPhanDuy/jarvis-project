@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 
 from jarvis.agents.base_agent import BaseAgent
@@ -53,6 +54,57 @@ class ResearcherAgent(BaseAgent):
 
     def get_messages(self) -> list[dict]:
         return self._messages
+
+    def run_turn(
+        self,
+        messages: list[dict],
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> tuple[str, list[dict]]:
+        # Proactive memory surfacing: inject relevant prior context into the user turn
+        messages = self._inject_memory_context(messages)
+        response, updated = super().run_turn(messages, on_chunk)
+        # Auto knowledge graph extraction in background (zero latency impact)
+        self._extract_graph_async(response)
+        return response, updated
+
+    def _inject_memory_context(self, messages: list[dict]) -> list[dict]:
+        if not messages or messages[-1].get("role") != "user":
+            return messages
+        try:
+            from jarvis.config import get_settings
+            if not get_settings().proactive_memory_enabled:
+                return messages
+            from jarvis.memory.surfacing import surface_memory
+            db_path = get_settings().reports_dir / "jarvis.db"
+            query = str(messages[-1].get("content", ""))
+            ctx = surface_memory(query, db_path, self._user_id)
+            if ctx:
+                augmented = list(messages)
+                augmented[-1] = {
+                    "role": "user",
+                    "content": f"[Relevant memory context]\n{ctx}\n\n[User query]\n{query}",
+                }
+                return augmented
+        except Exception:
+            pass
+        return messages
+
+    def _extract_graph_async(self, response: str) -> None:
+        try:
+            from jarvis.config import get_settings
+            if not get_settings().auto_graph_extraction:
+                return
+            db_path = get_settings().reports_dir / "jarvis.db"
+            model = self._model
+            user_id = self._user_id
+        except Exception:
+            return
+        from jarvis.agents.graph_extractor import extract_graph_from_text
+        threading.Thread(
+            target=extract_graph_from_text,
+            args=(response, db_path, model, user_id),
+            daemon=True,
+        ).start()
 
     def run_conversation(
         self,

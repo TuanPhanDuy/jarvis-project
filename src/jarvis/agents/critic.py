@@ -1,10 +1,15 @@
 """CriticAgent — evaluates sub-agent outputs and flags low-quality results."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+
+import structlog
 
 from jarvis.agents.base_agent import BaseAgent
 from jarvis.prompts.loader import load_prompt
+
+log = structlog.get_logger()
 
 
 @dataclass
@@ -25,11 +30,32 @@ class CriticAgent(BaseAgent):
         try:
             response_text, _ = self.run_turn(messages)
             return _parse_critique(response_text)
-        except Exception:
+        except Exception as exc:
+            log.warning("critic_failed", task_preview=task[:100], error=str(exc))
             return CritiqueResult(score=3, issues=[], should_retry=False)
 
 
 def _parse_critique(text: str) -> CritiqueResult:
+    # Try JSON first (primary path — matches the updated critic prompt)
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            data = json.loads(text[start:end])
+            score = int(data.get("score", 3))
+            issues_raw = data.get("issues", [])
+            issues = (
+                issues_raw if isinstance(issues_raw, list)
+                else ([] if str(issues_raw).lower() == "none" else [str(issues_raw)])
+            )
+            should_retry = bool(data.get("retry", False))
+            revised = data.get("revised_task")
+            revised_task = None if not revised or str(revised).lower() == "none" else str(revised)
+            return CritiqueResult(score=score, issues=issues, should_retry=should_retry, revised_task=revised_task)
+    except (ValueError, KeyError):
+        pass
+
+    # Fall back to legacy key-value format
     lines = {}
     for line in text.strip().splitlines():
         if ":" in line:

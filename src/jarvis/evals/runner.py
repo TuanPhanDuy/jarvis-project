@@ -3,13 +3,18 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+import structlog
+
 from jarvis.evals.suite import EvalCase
+
+log = structlog.get_logger()
 
 
 @dataclass
@@ -60,6 +65,17 @@ def _judge(case: EvalCase, response: str, model: str) -> tuple[int, str]:
         return 0, f"judge_error: {e}"
 
 
+def _git_hash() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
 def run_suite(
     cases: list[EvalCase],
     settings,
@@ -75,10 +91,8 @@ def run_suite(
     )
 
     filtered = [c for c in cases if not tags_filter or any(t in c.tags for t in tags_filter)]
-    results: list[EvalResult] = []
-    _pool = ThreadPoolExecutor(max_workers=1)
 
-    for case in filtered:
+    def _run_one(case: EvalCase) -> EvalResult:
         agent = ResearcherAgent(
             model=settings.model,
             max_tokens=settings.max_tokens,
@@ -89,8 +103,9 @@ def run_suite(
         error = ""
         response = ""
         try:
-            future = _pool.submit(agent.run_turn, [{"role": "user", "content": case.prompt}])
-            response, _ = future.result(timeout=case.timeout_seconds)
+            with ThreadPoolExecutor(max_workers=1) as _inner:
+                future = _inner.submit(agent.run_turn, [{"role": "user", "content": case.prompt}])
+                response, _ = future.result(timeout=case.timeout_seconds)
         except FuturesTimeoutError:
             error = "timed_out"
         except Exception as e:
@@ -103,10 +118,10 @@ def run_suite(
         judge_score, judge_reason = None, ""
         if use_judge and case.judge_rubric and response:
             score, reason = _judge(case, response, settings.model)
-            judge_score = score or None
+            judge_score = score if score > 0 else None
             judge_reason = reason
 
-        results.append(EvalResult(
+        return EvalResult(
             case_id=case.id,
             prompt=case.prompt,
             response=response,
@@ -120,7 +135,12 @@ def run_suite(
             judge_score=judge_score,
             judge_reasoning=judge_reason,
             error=error,
-        ))
+        )
+
+    max_workers = min(len(filtered), 4) if filtered else 1
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_run_one, case) for case in filtered]
+        results = [f.result() for f in futures]
 
     return results
 
@@ -131,13 +151,14 @@ def persist_results(results: list[EvalResult], summary: dict, output_dir: Path) 
         history_path = output_dir / "eval_history.jsonl"
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "git_hash": _git_hash(),
             "summary": summary,
             "results": [dataclasses.asdict(r) for r in results],
         }
         with history_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.error("persist_results_failed", error=str(exc))
 
 
 def summarize(results: list[EvalResult]) -> dict:

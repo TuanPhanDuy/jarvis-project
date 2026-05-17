@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import signal
 import sys
+import time as _time
 
 import pika
 import structlog
@@ -39,9 +40,11 @@ log = structlog.get_logger()
 
 RESULTS_QUEUE = "jarvis.results"
 _running = True
+_channel: "pika.channel.Channel | None" = None
 
 
 def _on_message(channel, method, properties, body: bytes) -> None:
+    t0 = _time.perf_counter()
     try:
         task = QueueTask(**json.loads(body))
     except Exception as exc:
@@ -60,26 +63,31 @@ def _on_message(channel, method, properties, body: bytes) -> None:
         routing_key = RESULTS_QUEUE
         log.info("task_result_no_reply_to", task_id=task.task_id, fallback_queue=RESULTS_QUEUE)
 
-    channel.basic_publish(
-        exchange="",
-        routing_key=routing_key,
-        body=result.model_dump_json(),
-        properties=pika.BasicProperties(
-            delivery_mode=pika.DeliveryMode.Persistent,
-            content_type="application/json",
-            correlation_id=task.task_id,
-        ),
-    )
-
-    channel.basic_ack(delivery_tag=method.delivery_tag)
-    log.info("message_acked", task_id=task.task_id, error=result.error)
+    try:
+        channel.basic_publish(
+            exchange="",
+            routing_key=routing_key,
+            body=result.model_dump_json(),
+            properties=pika.BasicProperties(
+                delivery_mode=pika.DeliveryMode.Persistent,
+                content_type="application/json",
+                correlation_id=task.task_id,
+            ),
+        )
+        channel.basic_ack(delivery_tag=method.delivery_tag)
+        latency = round(_time.perf_counter() - t0, 3)
+        log.info("message_acked", task_id=task.task_id, error=result.error, latency_s=latency)
+    except Exception as exc:
+        log.error("publish_failed", task_id=task.task_id, error=str(exc))
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
 
 def _shutdown(signum, frame) -> None:
-    global _running
+    global _running, _channel
     log.info("shutdown_signal_received")
     _running = False
-    sys.exit(0)
+    if _channel and _channel.is_open:
+        _channel.stop_consuming()
 
 
 def _connect_with_retry(rabbitmq_url: str, max_retries: int = 10) -> pika.BlockingConnection:
@@ -107,10 +115,12 @@ def main() -> None:
         queue=settings.rabbitmq_task_queue,
     )
 
+    global _channel
     while _running:
         try:
             connection = _connect_with_retry(settings.rabbitmq_url)
             channel = connection.channel()
+            _channel = channel
             channel.queue_declare(queue=settings.rabbitmq_task_queue, durable=True)
             channel.basic_qos(prefetch_count=1)  # one task at a time per worker
             channel.basic_consume(
@@ -123,7 +133,6 @@ def main() -> None:
             if not _running:
                 break
             log.error("worker_disconnected", error=str(exc), action="reconnecting")
-            import time as _time
             _time.sleep(5)
 
 

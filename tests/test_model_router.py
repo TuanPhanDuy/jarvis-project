@@ -1,89 +1,81 @@
 """Unit tests for ModelRouter smart routing logic. No API keys needed."""
 from __future__ import annotations
 
-import pytest
-
-pytest.skip("ModelRouter removed — agents use Ollama directly", allow_module_level=True)
-
-from unittest.mock import MagicMock, patch
-
-from jarvis.models.router import ModelRouter, _MessagesAPI
+from jarvis.models.router import ModelRouter
 
 
-def _make_router(strategy="smart", primary_model="claude-sonnet-4-6", fast_model="claude-haiku-4-5-20251001"):
-    primary = MagicMock()
-    return ModelRouter(primary=primary, primary_model=primary_model, fast_model=fast_model, strategy=strategy)
+class TestModelRouter:
+    def test_always_primary_uses_primary_for_empty_messages(self) -> None:
+        r = ModelRouter("big", "small", "always_primary")
+        assert r.select([]) == "big"
 
+    def test_always_primary_uses_primary_even_with_tool_results(self) -> None:
+        r = ModelRouter("big", "small", "always_primary")
+        msgs = [{"role": "tool", "content": "some result"}]
+        assert r.select(msgs) == "big"
 
-class TestModelRouterInit:
-    def test_attributes_set(self) -> None:
-        router = _make_router()
-        assert router.primary_model == "claude-sonnet-4-6"
-        assert router.fast_model == "claude-haiku-4-5-20251001"
-        assert router.strategy == "smart"
+    def test_smart_empty_messages_uses_primary(self) -> None:
+        r = ModelRouter("big", "small", "smart")
+        assert r.select([]) == "big"
 
-    def test_fast_model_defaults_to_primary(self) -> None:
-        primary = MagicMock()
-        router = ModelRouter(primary=primary, primary_model="claude-sonnet-4-6")
-        assert router.fast_model == "claude-sonnet-4-6"
+    def test_smart_user_only_uses_primary(self) -> None:
+        r = ModelRouter("big", "small", "smart")
+        msgs = [{"role": "user", "content": "What is RLHF?"}]
+        assert r.select(msgs) == "big"
 
-    def test_messages_api_attached(self) -> None:
-        router = _make_router()
-        assert isinstance(router.messages, _MessagesAPI)
+    def test_smart_tool_result_in_messages_uses_fast(self) -> None:
+        r = ModelRouter("big", "small", "smart")
+        msgs = [{"role": "tool", "content": "search results here"}]
+        assert r.select(msgs) == "small"
 
-
-class TestSmartRouting:
-    def test_plain_string_user_message_uses_primary(self) -> None:
-        router = _make_router(strategy="smart")
-        api = router.messages
-        messages = [{"role": "user", "content": "What is RLHF?"}]
-        model = api._select_model({"messages": messages})
-        assert model == "claude-sonnet-4-6"
-
-    def test_tool_result_content_uses_fast(self) -> None:
-        router = _make_router(strategy="smart")
-        api = router.messages
-        messages = [
+    def test_smart_mixed_messages_with_tool_result_uses_fast(self) -> None:
+        r = ModelRouter("big", "small", "smart")
+        msgs = [
             {"role": "user", "content": "Research RLHF"},
-            {"role": "assistant", "content": [{"type": "tool_use", "id": "1", "name": "web_search", "input": {}}]},
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "results"}]},
+            {"role": "assistant", "content": "searching..."},
+            {"role": "tool", "content": "found: reward modeling"},
         ]
-        model = api._select_model({"messages": messages})
-        assert model == "claude-haiku-4-5-20251001"
+        assert r.select(msgs) == "small"
 
-    def test_empty_messages_uses_primary(self) -> None:
-        router = _make_router(strategy="smart")
-        model = router.messages._select_model({"messages": []})
-        assert model == "claude-sonnet-4-6"
+    def test_unknown_strategy_falls_back_to_primary(self) -> None:
+        r = ModelRouter("big", "small", "unknown_strategy")
+        msgs = [{"role": "tool", "content": "result"}]
+        assert r.select(msgs) == "big"
 
-    def test_always_primary_strategy_ignores_content_type(self) -> None:
-        router = _make_router(strategy="always_primary")
-        # _select_model is only called when strategy == "smart"
-        # When always_primary, create() does NOT call _select_model
-        primary = router.primary
-        router.messages.create(model="claude-sonnet-4-6", messages=[
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "y"}]}
-        ], max_tokens=100)
-        # model param passed through unchanged
-        call_kwargs = primary.messages.create.call_args[1]
-        assert call_kwargs["model"] == "claude-sonnet-4-6"
+    def test_system_messages_do_not_trigger_fast_model(self) -> None:
+        r = ModelRouter("big", "small", "smart")
+        msgs = [{"role": "system", "content": "you are an assistant"}]
+        assert r.select(msgs) == "big"
 
-    def test_smart_strategy_overrides_model_param(self) -> None:
-        router = _make_router(strategy="smart")
-        primary = router.primary
-        tool_result_messages = [
-            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "data"}]}
-        ]
-        router.messages.create(model="claude-sonnet-4-6", messages=tool_result_messages, max_tokens=100)
-        call_kwargs = primary.messages.create.call_args[1]
-        # Should have been overridden to fast model
-        assert call_kwargs["model"] == "claude-haiku-4-5-20251001"
+    def test_primary_same_as_fast_always_returns_same(self) -> None:
+        r = ModelRouter("same-model", "same-model", "smart")
+        assert r.select([]) == "same-model"
+        assert r.select([{"role": "tool", "content": "x"}]) == "same-model"
 
-    def test_stream_always_uses_primary_client(self) -> None:
-        router = _make_router(strategy="smart")
-        primary = router.primary
-        router.messages.stream(model="x", messages=[], max_tokens=10)
-        primary.messages.stream.assert_called_once()
+    def test_agent_model_map_overrides_primary(self) -> None:
+        r = ModelRouter("big", "small", "always_primary", {"coder": "codellama:7b"})
+        assert r.select([], agent_type="coder") == "codellama:7b"
+
+    def test_agent_model_map_overrides_smart_routing(self) -> None:
+        r = ModelRouter("big", "small", "smart", {"researcher": "qwen2.5:14b"})
+        msgs = [{"role": "tool", "content": "results"}]
+        # Normally smart would use "small"; override wins
+        assert r.select(msgs, agent_type="researcher") == "qwen2.5:14b"
+
+    def test_agent_type_not_in_map_falls_through_to_strategy(self) -> None:
+        r = ModelRouter("big", "small", "smart", {"coder": "codellama:7b"})
+        msgs = [{"role": "tool", "content": "results"}]
+        # "researcher" not in map → smart routing → fast
+        assert r.select(msgs, agent_type="researcher") == "small"
+
+    def test_empty_agent_type_uses_strategy(self) -> None:
+        r = ModelRouter("big", "small", "always_primary", {"coder": "codellama:7b"})
+        assert r.select([], agent_type="") == "big"
+
+    def test_no_agent_model_map_behaves_as_before(self) -> None:
+        r = ModelRouter("big", "small", "smart")
+        msgs = [{"role": "tool", "content": "result"}]
+        assert r.select(msgs) == "small"
 
 
 class TestHybridSearch:

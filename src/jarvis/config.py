@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     ollama_base_url: str = Field("http://localhost:11434", alias="OLLAMA_BASE_URL")
 
     max_tokens: int = Field(8096, alias="JARVIS_MAX_TOKENS")
+    fast_model: str = Field("qwen2.5:3b", alias="JARVIS_FAST_MODEL")
+    routing_strategy: str = Field("always_primary", alias="JARVIS_ROUTING_STRATEGY")
+    agent_model_map: dict[str, str] = Field(
+        default={},
+        alias="JARVIS_AGENT_MODELS",
+        description="JSON map of agent-type → model override, e.g. '{\"coder\": \"codellama:7b\"}'",
+    )
     reports_dir: Path = Field(Path("reports"), alias="JARVIS_REPORTS_DIR")
     max_search_calls: int = Field(20, alias="JARVIS_MAX_SEARCH_CALLS")
     allowed_commands: list[str] = Field(
@@ -42,6 +49,14 @@ class Settings(BaseSettings):
 
     # Memory
     memory_retention_days: int = Field(90, alias="JARVIS_MEMORY_RETENTION_DAYS")
+
+    # Agent reasoning enhancements
+    reflection_enabled: bool = Field(False, alias="JARVIS_REFLECTION_ENABLED")
+    confidence_gate_enabled: bool = Field(True, alias="JARVIS_CONFIDENCE_GATE")
+    auto_graph_extraction: bool = Field(False, alias="JARVIS_AUTO_GRAPH_EXTRACTION")
+    proactive_memory_enabled: bool = Field(False, alias="JARVIS_PROACTIVE_MEMORY")
+    goal_verification_enabled: bool = Field(True, alias="JARVIS_GOAL_VERIFICATION")
+    consensus_n_agents: int = Field(3, alias="JARVIS_CONSENSUS_N_AGENTS")
 
     # Agent turn timeout
     agent_turn_timeout_seconds: int = Field(120, alias="JARVIS_AGENT_TURN_TIMEOUT")

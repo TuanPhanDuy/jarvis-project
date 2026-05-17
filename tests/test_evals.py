@@ -1,8 +1,11 @@
 """Unit tests for eval framework scoring logic. No API keys needed."""
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from jarvis.evals.suite import EvalCase, BASELINE_SUITE
-from jarvis.evals.runner import EvalResult, _score_case, summarize
+from jarvis.evals.runner import EvalResult, _score_case, _git_hash, persist_results, summarize
 
 
 class TestEvalCase:
@@ -65,6 +68,28 @@ class TestScoreCase:
         c_ok, f_ok, failed, found = _score_case(case, "anything at all")
         assert c_ok is True
         assert f_ok is True
+
+
+class TestGitHash:
+    def test_returns_string(self):
+        result = _git_hash()
+        assert isinstance(result, str)
+
+    def test_persist_results_includes_git_hash(self, tmp_path: Path):
+        results: list[EvalResult] = []
+        summary = {"total": 0, "passed": 0, "failed": 0, "pass_rate": 0}
+        persist_results(results, summary, tmp_path)
+        line = (tmp_path / "eval_history.jsonl").read_text().strip()
+        record = json.loads(line)
+        assert "git_hash" in record
+        assert isinstance(record["git_hash"], str)
+
+    def test_persist_results_appends_multiple_runs(self, tmp_path: Path):
+        summary = {"total": 1, "passed": 1, "failed": 0, "pass_rate": 1.0}
+        persist_results([], summary, tmp_path)
+        persist_results([], summary, tmp_path)
+        lines = (tmp_path / "eval_history.jsonl").read_text().strip().splitlines()
+        assert len(lines) == 2
 
 
 class TestSummarize:

@@ -7,10 +7,13 @@ from pathlib import Path
 import pytest
 
 from jarvis.memory.episodic import log_episode, handle_search_episodic_memory, prune_old_episodes
-from jarvis.memory.graph import handle_update_knowledge_graph, handle_query_knowledge_graph
+from jarvis.memory.graph import handle_update_knowledge_graph, handle_query_knowledge_graph, QUERY_SCHEMA
 from jarvis.memory.feedback import log_feedback, get_feedback_stats, handle_record_feedback, prune_old_feedback
 from jarvis.memory.failures import prune_old_failures
-from jarvis.memory.preferences import upsert_preference, get_preferences, prune_old_preferences
+from jarvis.memory.preferences import (
+    upsert_preference, get_preferences, prune_old_preferences,
+    get_preference_context, _get_conn as pref_conn,
+)
 
 
 # ── Episodic memory ───────────────────────────────────────────────────────────
@@ -225,3 +228,189 @@ class TestMemoryPruning:
         assert deleted == 0
         prefs = get_preferences(db, "bob")
         assert "technical_depth" in prefs
+
+
+# ── Knowledge graph: multi-hop traversal ─────────────────────────────────────
+
+class TestKnowledgeGraphMultiHop:
+    def _build(self, db, rels):
+        handle_update_knowledge_graph({"relationships": rels}, db)
+
+    def test_multi_hop_depth2_follows_transitive_edges(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        self._build(db, [
+            {"from": "RLHF", "relation": "uses", "to": "PPO"},
+            {"from": "PPO", "relation": "is_variant_of", "to": "Policy Gradient"},
+        ])
+        result = handle_query_knowledge_graph({"entity": "RLHF", "depth": 2}, db)
+        assert "Policy Gradient" in result
+        assert "depth=2" in result
+
+    def test_multi_hop_circular_graph_no_infinite_loop(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        self._build(db, [
+            {"from": "A", "relation": "links", "to": "B"},
+            {"from": "B", "relation": "links", "to": "A"},
+        ])
+        result = handle_query_knowledge_graph({"entity": "A", "depth": 3}, db)
+        assert "A" in result
+        assert "B" in result
+        assert "ERROR" not in result
+
+    def test_relation_filter_limits_edge_types(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        self._build(db, [
+            {"from": "RLHF", "relation": "uses", "to": "PPO"},
+            {"from": "RLHF", "relation": "developed_by", "to": "OpenAI"},
+        ])
+        result = handle_query_knowledge_graph(
+            {"entity": "RLHF", "depth": 1, "relation_filter": "uses"}, db
+        )
+        assert "PPO" in result
+        assert "OpenAI" not in result
+
+    def test_depth_and_filter_in_query_schema(self) -> None:
+        props = QUERY_SCHEMA["input_schema"]["properties"]
+        assert "depth" in props
+        assert "relation_filter" in props
+        assert props["depth"]["maximum"] == 3
+
+
+# ── Preference temporal decay ─────────────────────────────────────────────────
+
+class TestPreferenceDecay:
+    def test_fresh_preference_appears_in_context(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        upsert_preference(db, "u", "tool_prefs", "language", "Python", confidence=0.5)
+        ctx = get_preference_context(db, "u", decay=True)
+        assert "Python" in ctx
+
+    def test_ancient_preference_filtered_by_decay(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        conn = pref_conn(db)
+        conn.execute(
+            "INSERT INTO user_preferences VALUES (?,?,?,?,?,?,?)",
+            ("u", "tool_prefs", "language", "COBOL", 0.5, "inferred", time.time() - 500 * 86400),
+        )
+        conn.commit()
+        conn.close()
+        ctx = get_preference_context(db, "u", decay=True)
+        assert "COBOL" not in ctx
+
+    def test_decay_false_shows_stale_preference(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        conn = pref_conn(db)
+        conn.execute(
+            "INSERT INTO user_preferences VALUES (?,?,?,?,?,?,?)",
+            ("u", "tool_prefs", "language", "COBOL", 0.5, "inferred", time.time() - 500 * 86400),
+        )
+        conn.commit()
+        conn.close()
+        ctx = get_preference_context(db, "u", decay=False)
+        assert "COBOL" in ctx
+
+    def test_recent_pref_outranks_old_high_confidence(self, tmp_path: Path) -> None:
+        db = tmp_path / "jarvis.db"
+        conn = pref_conn(db)
+        # Old preference (100 days): eff = 0.9 * exp(-0.01*100) ≈ 0.33 → stays in context
+        conn.execute(
+            "INSERT INTO user_preferences VALUES (?,?,?,?,?,?,?)",
+            ("u", "domain_interest", "area", "Databases", 0.9, "explicit", time.time() - 100 * 86400),
+        )
+        # Fresh preference: eff = 0.5 * 1.0 = 0.5 → outranks old one
+        conn.execute(
+            "INSERT INTO user_preferences VALUES (?,?,?,?,?,?,?)",
+            ("u", "domain_interest", "topic", "LLMs", 0.5, "inferred", time.time()),
+        )
+        conn.commit()
+        conn.close()
+        ctx = get_preference_context(db, "u", decay=True)
+        assert "LLMs" in ctx
+        assert "Databases" in ctx
+        # Fresh LLMs should appear before stale Databases in the output
+        assert ctx.index("LLMs") < ctx.index("Databases")
+
+
+# ── Consolidator: session clustering ─────────────────────────────────────────
+
+class TestConsolidatorClustering:
+    def test_consolidation_calls_llm_per_session(self, tmp_path: Path) -> None:
+        from unittest.mock import MagicMock, patch
+        from jarvis.memory.episodic import log_episode
+        from jarvis.memory.consolidator import consolidate_user_memory
+
+        db = tmp_path / "jarvis.db"
+        log_episode(db, "sess-A", "user", "I prefer Python", user_id="alice")
+        log_episode(db, "sess-A", "assistant", "Got it", user_id="alice")
+        log_episode(db, "sess-B", "user", "I like concise answers", user_id="alice")
+
+        mock_resp = MagicMock()
+        mock_resp.message.content = ""
+
+        with patch("ollama.chat", return_value=mock_resp) as mock_chat:
+            consolidate_user_memory(db, "alice", "test-model", lookback_hours=9999)
+
+        # 2 sessions → at least 2 extraction calls (plus up to 2 summary calls)
+        assert mock_chat.call_count >= 2
+
+    def test_consolidation_merges_duplicates_by_highest_confidence(self, tmp_path: Path) -> None:
+        from unittest.mock import MagicMock, patch
+        from jarvis.memory.episodic import log_episode
+        from jarvis.memory.consolidator import consolidate_user_memory
+        from jarvis.memory.preferences import get_preferences
+
+        db = tmp_path / "jarvis.db"
+        log_episode(db, "sess-A", "user", "I use Python", user_id="u")
+        log_episode(db, "sess-B", "user", "I use Python too", user_id="u")
+
+        responses = [
+            "PREFERENCE|tool_prefs|language|Python|0.7|explicit",  # sess-A extraction
+            "",                                                      # sess-A summary
+            "PREFERENCE|tool_prefs|language|Python|0.4|inferred",  # sess-B extraction
+            "",                                                      # sess-B summary
+        ]
+        idx = 0
+
+        def side_effect(**kwargs):
+            nonlocal idx
+            resp = MagicMock()
+            resp.message.content = responses[idx] if idx < len(responses) else ""
+            idx += 1
+            return resp
+
+        with patch("ollama.chat", side_effect=side_effect):
+            count = consolidate_user_memory(db, "u", "test-model", lookback_hours=9999)
+
+        assert count == 1
+        prefs = get_preferences(db, "u")
+        assert prefs["tool_prefs"]["language"] == "Python"
+
+    def test_consolidation_logs_conflict_on_disagreement(self, tmp_path: Path) -> None:
+        from unittest.mock import MagicMock, patch
+        from jarvis.memory.episodic import log_episode
+        from jarvis.memory.consolidator import consolidate_user_memory
+
+        db = tmp_path / "jarvis.db"
+        log_episode(db, "sess-A", "user", "I use Python", user_id="u")
+        log_episode(db, "sess-B", "user", "I use Rust now", user_id="u")
+
+        responses = [
+            "PREFERENCE|tool_prefs|language|Python|0.9|explicit",
+            "",
+            "PREFERENCE|tool_prefs|language|Rust|0.8|explicit",
+            "",
+        ]
+        idx = 0
+
+        def side_effect(**kwargs):
+            nonlocal idx
+            resp = MagicMock()
+            resp.message.content = responses[idx] if idx < len(responses) else ""
+            idx += 1
+            return resp
+
+        with patch("ollama.chat", side_effect=side_effect):
+            with patch("jarvis.memory.consolidator.log") as mock_log:
+                consolidate_user_memory(db, "u", "test-model", lookback_hours=9999)
+                warning_calls = mock_log.warning.call_args_list
+                assert any("preference_conflict" in str(c) for c in warning_calls)

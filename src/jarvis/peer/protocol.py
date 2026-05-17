@@ -44,17 +44,38 @@ def merge_incoming_delta(delta: dict, db_path: Path) -> int:
     return import_delta(db_path, delta)
 
 
+def pull_delta(peer_host: str, peer_port: int, since_ts: float = 0.0, timeout: float = 10.0) -> dict | None:
+    """GET graph delta from a peer since `since_ts`. Returns delta dict or None on failure."""
+    try:
+        import urllib.parse
+        import urllib.request
+
+        params = urllib.parse.urlencode({"since_ts": since_ts})
+        url = f"http://{peer_host}:{peer_port}/api/peer/delta?{params}"
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            import json as _json
+            return _json.loads(resp.read())
+    except Exception as exc:
+        log.warning("peer_pull_failed", host=peer_host, port=peer_port, error=str(exc))
+        return None
+
+
 def sync_with_peer(peer_host: str, peer_port: int, db_path: Path, last_sync_ts: float = 0.0) -> bool:
-    """Push our delta to a peer and request their delta back. Returns True if sync occurred."""
+    """Bidirectional sync: push our delta to a peer and pull their delta back."""
     from jarvis.edge.sync import export_delta
 
     delta = export_delta(db_path, since_ts=last_sync_ts)
-    if not delta["entities"] and not delta["relationships"]:
+    if delta["entities"] or delta["relationships"]:
+        pushed = push_delta(peer_host, peer_port, delta)
+        if pushed:
+            log.info("peer_sync_pushed", host=peer_host, port=peer_port,
+                     entities=len(delta["entities"]), rels=len(delta["relationships"]))
+    else:
         log.debug("peer_sync_nothing_to_push", host=peer_host)
-        return True  # nothing to push, still counts as success
 
-    success = push_delta(peer_host, peer_port, delta)
-    if success:
-        log.info("peer_sync_pushed", host=peer_host, port=peer_port,
-                 entities=len(delta["entities"]), rels=len(delta["relationships"]))
-    return success
+    incoming = pull_delta(peer_host, peer_port, since_ts=last_sync_ts)
+    if incoming:
+        count = merge_incoming_delta(incoming, db_path)
+        log.info("peer_sync_pulled", host=peer_host, port=peer_port, count=count)
+
+    return True

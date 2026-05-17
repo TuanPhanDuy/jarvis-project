@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
-from dataclasses import dataclass, field
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import structlog
+
+from jarvis.agents.step_summarizer import summarize_if_large
 
 log = structlog.get_logger()
 
@@ -51,23 +55,24 @@ def _get_conn(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _topo_sort(steps: list[PlanStep]) -> list[PlanStep]:
+def _topo_levels(steps: list[PlanStep]) -> list[list[PlanStep]]:
+    """Group steps into dependency levels; all steps in a level can run in parallel."""
     by_id = {s.id: s for s in steps}
-    visited: set[str] = set()
-    order: list[PlanStep] = []
+    levels: list[list[PlanStep]] = []
+    assigned: set[str] = set()
 
-    def visit(step: PlanStep) -> None:
-        if step.id in visited:
-            return
-        for dep_id in step.depends_on:
-            if dep_id in by_id:
-                visit(by_id[dep_id])
-        visited.add(step.id)
-        order.append(step)
-
-    for s in steps:
-        visit(s)
-    return order
+    while len(assigned) < len(steps):
+        level = [
+            s for s in steps
+            if s.id not in assigned
+            and all(dep in assigned for dep in s.depends_on if dep in by_id)
+        ]
+        if not level:
+            level = [s for s in steps if s.id not in assigned]
+        for s in level:
+            assigned.add(s.id)
+        levels.append(level)
+    return levels
 
 
 class ExecutorAgent:
@@ -99,46 +104,72 @@ class ExecutorAgent:
         critic = build_critic(self._model, self._max_tokens)
 
         context: dict[str, str] = {}
-        sorted_steps = _topo_sort(steps)
+        context_lock = threading.Lock()
+        levels = _topo_levels(steps)
+        all_steps_ordered: list[PlanStep] = []
 
-        for step in sorted_steps:
-            step.status = "running"
+        for level in levels:
+            for step in level:
+                step.status = "running"
             self._update_plan(plan_id, steps)
 
-            dep_context = ""
-            for dep_id in step.depends_on:
-                if dep_id in context:
-                    dep_context += f"\n\n[Context from step '{dep_id}']:\n{context[dep_id][:1000]}"
+            def _run_level_step(step: PlanStep) -> None:
+                with context_lock:
+                    dep_context = "".join(
+                        f"\n\n[Context from step '{dep_id}']:\n"
+                        f"{summarize_if_large(context[dep_id], dep_id, self._model)}"
+                        for dep_id in step.depends_on
+                        if dep_id in context
+                    )
 
-            task = step.description
-            if dep_context:
-                task = f"{task}\n\nContext from previous steps:{dep_context}"
-
-            result = self._run_step(step.agent_type, task)
-
-            critique = critic.critique(step.description, result)
-            log.info("plan_step_critiqued", plan_id=plan_id, step_id=step.id,
-                     score=critique.score, retry=critique.should_retry)
-
-            if critique.should_retry and critique.revised_task:
-                revised = critique.revised_task
+                task = step.description
                 if dep_context:
-                    revised = f"{revised}\n\nContext from previous steps:{dep_context}"
-                result = self._run_step(step.agent_type, revised)
+                    task = f"{task}\n\nContext from previous steps:{dep_context}"
 
-            step.status = "failed" if result.startswith("ERROR:") else "done"
-            step.result = result
-            context[step.id] = result
+                result = self._run_step(step.agent_type, task)
+
+                critique = critic.critique(step.description, result)
+                log.info("plan_step_critiqued", plan_id=plan_id, step_id=step.id,
+                         score=critique.score, retry=critique.should_retry)
+
+                if critique.should_retry and critique.revised_task:
+                    revised = critique.revised_task
+                    if dep_context:
+                        revised = f"{revised}\n\nContext from previous steps:{dep_context}"
+                    result = self._run_step(step.agent_type, revised)
+
+                step.status = "failed" if result.startswith("ERROR:") else "done"
+                step.result = result
+                with context_lock:
+                    context[step.id] = result
+
+            if len(level) == 1:
+                _run_level_step(level[0])
+            else:
+                with ThreadPoolExecutor(max_workers=len(level)) as pool:
+                    futures = {pool.submit(_run_level_step, step): step for step in level}
+                    for future in as_completed(futures):
+                        future.result()
+
             self._update_plan(plan_id, steps)
+            all_steps_ordered.extend(level)
 
-        any_failed = any(s.status == "failed" for s in sorted_steps)
+        any_failed = any(s.status == "failed" for s in steps)
         self._complete_plan(plan_id, steps, failed=any_failed)
 
         parts = [f"**Plan: {goal}**\n"]
-        for step in sorted_steps:
+        for step in all_steps_ordered:
             parts.append(f"### Step: {step.description}")
             parts.append(step.result or "(no result)")
             parts.append("")
+
+        verification = self._verify_goal(goal, all_steps_ordered)
+        if verification:
+            parts.append(f"## Goal Verification\n{verification}")
+            gap_result = self._fill_gaps(goal, verification, all_steps_ordered)
+            if gap_result:
+                parts.append(f"## Gap Remediation\n{gap_result}")
+
         return "\n".join(parts)
 
     def _run_step(self, agent_type: str, task: str) -> str:
@@ -172,6 +203,95 @@ class ExecutorAgent:
         except Exception as exc:
             return f"ERROR: step failed — {exc}"
 
+    def _verify_goal(self, goal: str, steps: list[PlanStep]) -> str:
+        """Check whether completed steps fully achieved the goal; return gap analysis or empty string."""
+        try:
+            from jarvis.config import get_settings
+            if not get_settings().goal_verification_enabled:
+                return ""
+        except Exception:
+            pass
+
+        results_summary = "\n".join(
+            f"Step '{s.description}' [{s.status}]: {(s.result or '')[:300]}"
+            for s in steps
+        )
+        prompt = (
+            f"Original goal: {goal}\n\n"
+            f"Completed steps and results:\n{results_summary}\n\n"
+            "Did the completed steps fully achieve the original goal?\n"
+            "If YES, reply: ACHIEVED\n"
+            "If NO, reply: GAPS: <one-sentence description of what remains>"
+        )
+        try:
+            import ollama
+            resp = ollama.chat(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.1, "num_predict": 128},
+            )
+            verdict = (resp.message.content or "").strip()
+            if verdict.upper().startswith("ACHIEVED"):
+                log.info("goal_achieved", goal=goal[:80])
+                return ""
+            log.info("goal_gaps_found", goal=goal[:80], verdict=verdict[:120])
+            return verdict
+        except Exception as exc:
+            log.debug("goal_verification_skipped", error=str(exc))
+            return ""
+
+    def _fill_gaps(self, goal: str, gaps: str, completed: list[PlanStep]) -> str:
+        """Generate and execute one remediation step to address identified gaps.
+
+        Asks the LLM to propose a single targeted task, then executes it.
+        Returns empty string if gap-filling is not possible.
+        """
+        try:
+            context_summary = "\n".join(
+                f"- {s.description}: {(s.result or '')[:200]}"
+                for s in completed
+                if s.status == "done"
+            )
+            prompt = (
+                f"Goal: {goal}\n\n"
+                f"Gap identified after execution: {gaps}\n\n"
+                f"Already completed steps:\n{context_summary}\n\n"
+                "Propose ONE concise remediation task (1-2 sentences) to address the gap.\n"
+                "Format your response as:\n"
+                "AGENT: <researcher|coder|qa|analyst|devops>\n"
+                "TASK: <task description>"
+            )
+            import ollama
+            resp = ollama.chat(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.2, "num_predict": 150},
+            )
+            text = (resp.message.content or "").strip()
+
+            agent_type = "researcher"
+            task_desc = ""
+            for line in text.splitlines():
+                upper = line.upper()
+                if upper.startswith("AGENT:"):
+                    candidate = line.split(":", 1)[1].strip().lower()
+                    if candidate in {"researcher", "coder", "qa", "analyst", "devops"}:
+                        agent_type = candidate
+                elif upper.startswith("TASK:"):
+                    task_desc = line.split(":", 1)[1].strip()
+
+            if not task_desc:
+                return ""
+
+            full_task = f"{task_desc}\n\nContext — gap to address: {gaps}"
+            result = self._run_step(agent_type, full_task)
+            log.info("gap_remediation_done",
+                     agent_type=agent_type, task=task_desc[:60], result_len=len(result))
+            return f"[{agent_type.upper()}] {result}"
+        except Exception as exc:
+            log.debug("gap_fill_skipped", error=str(exc))
+            return ""
+
     def _store_plan(self, plan_id: str, goal: str, steps: list[PlanStep]) -> None:
         if not self._db_path:
             return
@@ -184,8 +304,8 @@ class ExecutorAgent:
             )
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.error("plan_store_failed", plan_id=plan_id, error=str(exc))
 
     def _update_plan(self, plan_id: str, steps: list[PlanStep]) -> None:
         if not self._db_path:
@@ -196,8 +316,8 @@ class ExecutorAgent:
                          (json.dumps([s.__dict__ for s in steps]), plan_id))
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.error("plan_update_failed", plan_id=plan_id, error=str(exc))
 
     def _complete_plan(self, plan_id: str, steps: list[PlanStep], failed: bool = False) -> None:
         if not self._db_path:
@@ -211,5 +331,5 @@ class ExecutorAgent:
             )
             conn.commit()
             conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.error("plan_complete_failed", plan_id=plan_id, error=str(exc))

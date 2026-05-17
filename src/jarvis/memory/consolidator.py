@@ -33,6 +33,35 @@ Conversation:
 """
 
 
+def _cluster_by_session(rows) -> dict[str, list]:
+    """Group episode rows by session_id, preserving timestamp order."""
+    clusters: dict[str, list] = {}
+    for row in rows:
+        clusters.setdefault(row["session_id"], []).append(row)
+    return clusters
+
+
+def _parse_preference_lines(text: str) -> list[dict]:
+    """Parse PREFERENCE|category|key|value|confidence|source lines from LLM output."""
+    results = []
+    for line in text.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) == 6 and parts[0] == "PREFERENCE":
+            _, category, key, value, conf_str, source = parts
+            try:
+                confidence = float(conf_str)
+            except ValueError:
+                confidence = 0.5
+            results.append({
+                "category": category.strip(),
+                "key": key.strip(),
+                "value": value.strip(),
+                "confidence": confidence,
+                "source": source.strip(),
+            })
+    return results
+
+
 def consolidate_user_memory(
     db_path: Path,
     user_id: str,
@@ -41,7 +70,11 @@ def consolidate_user_memory(
 ) -> int:
     """Extract preferences from recent episodes and save them.
 
-    Returns the number of preferences upserted.
+    Processes episodes session-by-session to preserve context, then merges
+    extracted preferences by highest confidence. Logs conflicts when two sessions
+    disagree on the same key at high confidence.
+
+    Returns the number of unique preferences upserted.
     """
     import ollama
     from jarvis.memory.episodic import _get_conn as ep_conn
@@ -63,51 +96,72 @@ def consolidate_user_memory(
     if not rows:
         return 0
 
-    episode_text = "\n".join(
-        f"[{row['role'].upper()}]: {row['content'][:300]}" for row in rows
-    )
+    clusters = _cluster_by_session(rows)
 
-    try:
-        response = ollama.chat(
-            model=model,
-            messages=[
-                {"role": "system", "content": "Extract user preferences from conversations."},
-                {"role": "user", "content": _EXTRACTION_PROMPT.format(episodes=episode_text)},
-            ],
-            options={"temperature": 0.1},
+    # Merge preferences across sessions: (category, key) → best candidate
+    best: dict[tuple, dict] = {}
+
+    for session_id, session_rows in clusters.items():
+        episode_text = "\n".join(
+            f"[{row['role'].upper()}]: {row['content'][:300]}" for row in session_rows
         )
-        text = response.message.content.strip()
-    except Exception as exc:
-        log.error("consolidate_llm_failed", user_id=user_id, error=str(exc))
-        return 0
+        try:
+            response = ollama.chat(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "Extract user preferences from conversations."},
+                    {"role": "user", "content": _EXTRACTION_PROMPT.format(episodes=episode_text)},
+                ],
+                options={"temperature": 0.1},
+            )
+            extracted = _parse_preference_lines(response.message.content.strip())
+        except Exception as exc:
+            log.error("consolidate_llm_failed", user_id=user_id, session=session_id, error=str(exc))
+            continue
 
-    count = 0
-    for line in text.splitlines():
-        parts = line.strip().split("|")
-        if len(parts) == 6 and parts[0] == "PREFERENCE":
-            _, category, key, value, confidence_str, source = parts
-            try:
-                confidence = float(confidence_str)
-            except ValueError:
-                confidence = 0.5
-            upsert_preference(db_path, user_id, category.strip(), key.strip(), value.strip(), confidence, source.strip())
-            count += 1
+        for pref in extracted:
+            k = (pref["category"], pref["key"])
+            if k not in best:
+                best[k] = pref
+            else:
+                existing = best[k]
+                if (
+                    existing["confidence"] >= 0.6
+                    and pref["confidence"] >= 0.6
+                    and existing["value"] != pref["value"]
+                ):
+                    log.warning(
+                        "preference_conflict",
+                        user_id=user_id,
+                        key=pref["key"],
+                        old_value=existing["value"],
+                        new_value=pref["value"],
+                    )
+                if pref["confidence"] > existing["confidence"]:
+                    best[k] = pref
 
-    if rows:
-        session_ids = list({row["session_id"] for row in rows})
-        summary_prompt = f"Summarize this conversation in 2-3 sentences:\n\n{episode_text[:2000]}"
+        # Session summary
+        summary_text = "\n".join(
+            f"[{row['role'].upper()}]: {row['content'][:300]}" for row in session_rows
+        )
         try:
             summ_resp = ollama.chat(
                 model=model,
-                messages=[{"role": "user", "content": summary_prompt}],
+                messages=[{"role": "user", "content": f"Summarize this conversation in 2-3 sentences:\n\n{summary_text[:2000]}"}],
                 options={"temperature": 0.2},
             )
-            summary = summ_resp.message.content.strip()
-            for sid in session_ids[:5]:
-                save_session_summary(db_path, sid, user_id, summary, [])
+            save_session_summary(db_path, session_id, user_id, summ_resp.message.content.strip(), [])
         except Exception:
             pass
 
+    for pref in best.values():
+        upsert_preference(
+            db_path, user_id,
+            pref["category"], pref["key"], pref["value"],
+            pref["confidence"], pref["source"],
+        )
+
+    count = len(best)
     log.info("consolidation_complete", user_id=user_id, preferences_found=count)
     return count
 

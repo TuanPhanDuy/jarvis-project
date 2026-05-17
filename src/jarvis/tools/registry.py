@@ -7,8 +7,10 @@ from jarvis.tools import (
     browser,
     conversation_export,
     delegation,
+    delegation_batch,
     memory,
     os_command,
+    plan_template_tool,
     plan_tool,
     report_writer,
     url_reader,
@@ -20,6 +22,7 @@ from jarvis.memory import feedback as memory_feedback
 from jarvis.memory import graph as knowledge_graph
 from jarvis.memory import preferences as user_preferences
 from jarvis.vision import capture as vision_capture, face as vision_face
+from jarvis.twin import main as twin_main
 from jarvis.tools.plugin_loader import load_plugins
 
 
@@ -68,6 +71,9 @@ def build_registry(
         vision_capture.SCHEMA,
         vision_capture.DESCRIBE_SCHEMA,
         vision_face.SCHEMA,
+        # Digital Twin
+        twin_main.SNAPSHOT_SCHEMA,
+        twin_main.QUERY_SCHEMA,
     ]
     registry: dict[str, Callable[[dict], str]] = {
         "web_search":               lambda inp: web_search.handle_web_search(inp),
@@ -93,6 +99,9 @@ def build_registry(
         "capture_camera":           lambda inp: vision_capture.handle_capture_camera(inp, reports_dir),
         "describe_scene":           lambda inp: vision_capture.handle_describe_scene(inp, reports_dir, vision_model),
         "recognize_face":           lambda inp: vision_face.handle_recognize_face(inp, reports_dir),
+        # Digital Twin
+        "snapshot_system":          lambda inp: twin_main.handle_snapshot_system(inp, db_path),
+        "query_system_twin":        lambda inp: twin_main.handle_query_system_twin(inp, db_path),
     }
 
     plugin_schemas, plugin_registry = load_plugins()
@@ -111,8 +120,14 @@ def build_planner_registry(
     session_id: str = "",
     user_id: str | None = None,
 ) -> tuple[list[dict], dict[str, Callable[[dict], str]]]:
-    """Extend a base registry with delegate_task and create_plan for PlannerAgent."""
+    """Extend a base registry with delegate_task, delegate_batch, and create_plan for PlannerAgent."""
     delegation_handler = delegation.build_delegation_handler(
+        model=model,
+        max_tokens=max_tokens,
+        sub_tool_schemas=base_schemas,
+        sub_tool_registry=base_registry,
+    )
+    batch_handler = delegation_batch.build_batch_delegation_handler(
         model=model,
         max_tokens=max_tokens,
         sub_tool_schemas=base_schemas,
@@ -127,8 +142,24 @@ def build_planner_registry(
         session_id=session_id,
         user_id=user_id,
     )
-    planner_schemas = base_schemas + [delegation.SCHEMA, plan_tool.SCHEMA]
+    template_handler = plan_template_tool.build_plan_template_handler(
+        model=model,
+        max_tokens=max_tokens,
+        sub_tool_schemas=base_schemas,
+        sub_tool_registry=base_registry,
+        db_path=db_path,
+        session_id=session_id,
+        user_id=user_id,
+    )
+    planner_schemas = base_schemas + [
+        delegation.SCHEMA,
+        delegation_batch.SCHEMA,
+        plan_tool.SCHEMA,
+        plan_template_tool.SCHEMA,
+    ]
     planner_registry = dict(base_registry)
     planner_registry["delegate_task"] = delegation_handler
+    planner_registry["delegate_batch"] = batch_handler
     planner_registry["create_plan"] = plan_handler
+    planner_registry["plan_from_template"] = template_handler
     return planner_schemas, planner_registry

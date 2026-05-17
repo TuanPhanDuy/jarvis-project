@@ -5,7 +5,7 @@ import pytest
 
 ALL_TOOL_NAMES = [
     "web_search", "read_url", "browse",
-    "search_memory", "search_episodic_memory", "query_knowledge_graph",
+    "search_memory", "search_episodic_memory", "query_knowledge_graph", "update_knowledge_graph",
     "analyze_text", "summarize_youtube",
     "save_report", "update_report",
     "filesystem_search",
@@ -15,6 +15,7 @@ ALL_TOOL_NAMES = [
     "ingest_document",
     "system_info",
     "delegate_task", "create_plan",
+    "recall_user_preferences", "analyze_failures", "record_feedback",
     "get_weather", "generate_tool", "ask_local_model",
     "read_calendar", "analyze_image",
 ]
@@ -114,6 +115,59 @@ class TestDevOpsToolFilter:
         from jarvis.agents.devops import DevOpsAgent
         a = DevOpsAgent("llama3.2", 512, _MOCK_SCHEMAS, _MOCK_REGISTRY)
         assert "delegate_task" not in _names(a)
+
+
+class TestTeamAgentToolFilter:
+    def test_manager_allows_delegate_task(self):
+        from jarvis.agents.team_agent import TeamAgent
+        a = TeamAgent("llama3.2", 512, _MOCK_SCHEMAS, _MOCK_REGISTRY, role="manager")
+        assert "delegate_task" in _names(a)
+
+    def test_manager_blocks_web_search(self):
+        from jarvis.agents.team_agent import TeamAgent
+        a = TeamAgent("llama3.2", 512, _MOCK_SCHEMAS, _MOCK_REGISTRY, role="manager")
+        assert "web_search" not in _names(a)
+
+    def test_manager_blocks_run_command(self):
+        from jarvis.agents.team_agent import TeamAgent
+        a = TeamAgent("llama3.2", 512, _MOCK_SCHEMAS, _MOCK_REGISTRY, role="manager")
+        assert "run_command" not in _names(a)
+
+    def test_frontend_allows_execute_python(self):
+        from jarvis.agents.team_agent import TeamAgent
+        a = TeamAgent("llama3.2", 512, _MOCK_SCHEMAS, _MOCK_REGISTRY, role="frontend")
+        assert "execute_python" in _names(a)
+
+    def test_frontend_blocks_run_command(self):
+        from jarvis.agents.team_agent import TeamAgent
+        a = TeamAgent("llama3.2", 512, _MOCK_SCHEMAS, _MOCK_REGISTRY, role="frontend")
+        assert "run_command" not in _names(a)
+
+    def test_backend_allows_database_query(self):
+        from jarvis.agents.team_agent import TeamAgent
+        a = TeamAgent("llama3.2", 512, _MOCK_SCHEMAS, _MOCK_REGISTRY, role="backend")
+        assert "database_query" in _names(a)
+
+    def test_team_lead_allows_git_context(self):
+        from jarvis.agents.team_agent import TeamAgent
+        a = TeamAgent("llama3.2", 512, _MOCK_SCHEMAS, _MOCK_REGISTRY, role="team_lead")
+        assert "git_context" in _names(a)
+
+    def test_team_lead_blocks_execute_python(self):
+        from jarvis.agents.team_agent import TeamAgent
+        a = TeamAgent("llama3.2", 512, _MOCK_SCHEMAS, _MOCK_REGISTRY, role="team_lead")
+        assert "execute_python" not in _names(a)
+
+    def test_invalid_role_raises_value_error(self):
+        from jarvis.agents.team_agent import TeamAgent
+        with pytest.raises(ValueError, match="Unknown team role"):
+            TeamAgent("llama3.2", 512, _MOCK_SCHEMAS, _MOCK_REGISTRY, role="devops")
+
+    @pytest.mark.parametrize("role", ["manager", "team_lead", "frontend", "backend"])
+    def test_schema_registry_in_sync_for_all_roles(self, role):
+        from jarvis.agents.team_agent import TeamAgent
+        a = TeamAgent("llama3.2", 512, _MOCK_SCHEMAS, _MOCK_REGISTRY, role=role)
+        assert _names(a) == _reg_names(a)
 
 
 class TestRegistryFilterConsistency:

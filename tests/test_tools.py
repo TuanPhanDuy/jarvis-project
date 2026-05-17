@@ -163,3 +163,33 @@ class TestToolSchemas:
         assert "title" in required
         assert "content" in required
         assert "topic" in required
+
+
+class TestPluginLoader:
+    def test_skips_plugin_with_missing_schema_keys(self, tmp_path: Path) -> None:
+        """Plugin whose SCHEMA is missing 'description' should be skipped."""
+        import sys
+        import types
+        from jarvis.tools.plugin_loader import load_plugins
+
+        bad_plugin = types.ModuleType("jarvis.tools.plugins._bad_test")
+        bad_plugin.SCHEMA = {"name": "bad_tool", "input_schema": {"type": "object", "properties": {}}}
+        bad_plugin.handle = lambda inp: "ok"
+
+        sys.modules["jarvis.tools.plugins._bad_test"] = bad_plugin
+        try:
+            schemas, registry = load_plugins()
+            assert "bad_tool" not in registry
+        finally:
+            del sys.modules["jarvis.tools.plugins._bad_test"]
+
+    def test_accepts_valid_schema(self, tmp_path: Path) -> None:
+        """Plugin with all required SCHEMA keys should be accepted."""
+        from jarvis.tools.plugin_loader import load_plugins
+        schemas, registry = load_plugins()
+        for name, handler in registry.items():
+            matching = [s for s in schemas if s["name"] == name]
+            assert len(matching) == 1
+            schema = matching[0]
+            for key in ("name", "description", "input_schema"):
+                assert key in schema, f"Plugin '{name}' schema missing '{key}'"

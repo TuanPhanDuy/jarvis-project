@@ -47,6 +47,22 @@ class PlannerAgent(BaseAgent):
             except Exception:
                 pass
 
+            # Memory augmentation: surface prior session context and known entities
+            try:
+                from jarvis.config import get_settings
+                from jarvis.memory.preferences import get_recent_session_summaries
+                from jarvis.memory.graph import get_recent_entities
+                db_path = get_settings().reports_dir / "jarvis.db"
+                summaries = get_recent_session_summaries(db_path, self._user_id, limit=3)
+                if summaries:
+                    bullet_list = "\n".join(f"- {s}" for s in summaries)
+                    extras.append(f"## Prior session context\n{bullet_list}")
+                entities = get_recent_entities(db_path, self._user_id, limit=20)
+                if entities:
+                    extras.append(f"## Already known entities (skip redundant research)\n{', '.join(entities)}")
+            except Exception:
+                pass
+
         return base + ("\n\n" + "\n\n".join(extras) if extras else "")
 
     def get_messages(self) -> list[dict]:
