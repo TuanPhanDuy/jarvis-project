@@ -93,6 +93,18 @@ class Settings(BaseSettings):
     # WebSocket heartbeat
     ws_heartbeat_seconds: int = Field(30, alias="JARVIS_WS_HEARTBEAT")
 
+    # Training pipeline
+    anthropic_api_key: str = Field("", alias="ANTHROPIC_API_KEY")
+    training_data_dir: Path = Field(Path("reports/training"), alias="JARVIS_TRAINING_DIR")
+    training_base_model_mlx: str = Field(
+        "mlx-community/Qwen2.5-14B-Instruct-4bit",
+        alias="JARVIS_TRAINING_BASE_MODEL",
+    )
+    training_max_papers_per_source: int = Field(10, alias="JARVIS_TRAINING_MAX_PAPERS")
+    training_lora_rank: int = Field(16, alias="JARVIS_TRAINING_LORA_RANK")
+    training_lora_epochs: int = Field(3, alias="JARVIS_TRAINING_EPOCHS")
+    training_target_pairs: int = Field(500, alias="JARVIS_TRAINING_TARGET_PAIRS")
+
     model_config = {"populate_by_name": True}
 
     @field_validator("max_tokens")

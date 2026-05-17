@@ -74,6 +74,13 @@ docs = [
     "python-docx>=1.1",
     "youtube-transcript-api>=0.6",
 ]
+training = [
+    "anthropic>=0.40.0",
+    "arxiv>=2.1",
+    "huggingface-hub>=0.24",
+    "datasets>=2.20",
+    "mlx-lm>=0.22",
+]
 
 [project.scripts]
 jarvis = "jarvis.main:main"
@@ -81,6 +88,7 @@ jarvis-api = "jarvis.api.server:main"
 jarvis-worker = "jarvis.queue.worker:main"
 jarvis-edge = "jarvis.edge.main:main"
 jarvis-eval = "jarvis.evals.main:main"
+jarvis-train = "jarvis.training.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/jarvis"]
