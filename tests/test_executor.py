@@ -53,7 +53,7 @@ class TestExecutorAgent:
         """Step B receives step A's result as injected context."""
         captured_tasks: list[tuple[str, str]] = []
 
-        def fake_run_step(self_inner, agent_type, task):
+        def fake_run_step(self_inner, agent_type, task, **kwargs):
             captured_tasks.append((agent_type, task))
             return "result_of_A"
 
@@ -74,7 +74,7 @@ class TestExecutorAgent:
         """A step with score < 5 triggers one retry (_run_step called twice for that step)."""
         call_count = {"n": 0}
 
-        def fake_run_step(self_inner, agent_type, task):
+        def fake_run_step(self_inner, agent_type, task, **kwargs):
             call_count["n"] += 1
             return "short result"
 
@@ -92,7 +92,7 @@ class TestExecutorAgent:
     def test_failed_step_marks_plan_partial(self, tmp_path, mock_ollama):
         """A step returning ERROR:... sets plan status to partial_failure."""
 
-        def fake_run_step(self_inner, agent_type, task):
+        def fake_run_step(self_inner, agent_type, task, **kwargs):
             return "ERROR: something broke"
 
         with patch.object(ExecutorAgent, "_run_step", fake_run_step):

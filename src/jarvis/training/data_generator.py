@@ -1,17 +1,19 @@
 """Synthetic training data generator.
 
-Uses Claude Haiku with prompt caching to generate instruction-tuning Q&A pairs
-from documents stored in the JARVIS reports directory. Output is JSONL, one
-conversation object per line, compatible with mlx-lm fine-tuning format.
+Uses the local Ollama model to generate instruction-tuning Q&A pairs from
+documents in the JARVIS reports directory. Output is JSONL compatible with
+mlx-lm fine-tuning format — no external API key required.
 """
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
+import ollama
 import structlog
+
+from jarvis.config import get_settings
 
 log = structlog.get_logger()
 
@@ -22,13 +24,10 @@ _SYSTEM_PROMPT = (
     "- Provide a detailed, accurate answer grounded in the passage\n"
     "- Cover different aspects: definitions, mechanisms, tradeoffs, applications\n\n"
     "Output ONLY a JSON array of objects with keys 'question' and 'answer'. "
-    "No preamble, no markdown fences."
+    "No preamble, no markdown fences, no explanation."
 )
 
-_USER_TEMPLATE = (
-    "Passage:\n{chunk}\n\n"
-    "Generate {n_pairs} Q&A pairs as a JSON array."
-)
+_USER_TEMPLATE = "Passage:\n{chunk}\n\nGenerate {n_pairs} Q&A pairs as a JSON array."
 
 
 @dataclass
@@ -39,27 +38,22 @@ class QAPair:
 
 
 class TrainingDataGenerator:
-    """Generate instruction-tuning pairs from ChromaDB-indexed research documents."""
+    """Generate instruction-tuning pairs from research documents using local Ollama."""
 
-    def __init__(self, reports_dir: Path, api_key: str = "") -> None:
+    def __init__(self, reports_dir: Path, model: str = "") -> None:
         self._reports_dir = reports_dir
-        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-        if not self._api_key:
-            raise ValueError("ANTHROPIC_API_KEY must be set for training data generation")
+        self._model = model or get_settings().model
 
     def get_document_chunks(self, n: int = 50, chunk_size: int = 2000) -> list[tuple[str, str]]:
         """Return up to n (chunk_text, filename) pairs from markdown reports."""
         chunks: list[tuple[str, str]] = []
-        reports = sorted(self._reports_dir.glob("*.md"))
-        for report in reports:
+        for report in sorted(self._reports_dir.glob("*.md")):
             if len(chunks) >= n:
                 break
             try:
                 text = report.read_text(encoding="utf-8", errors="ignore")
-                # Skip the metadata header lines
                 body_start = text.find("\n\n") + 2
                 body = text[body_start:] if body_start > 2 else text
-                # Chunk into non-overlapping windows
                 for i in range(0, min(len(body), chunk_size * 4), chunk_size):
                     if len(chunks) >= n:
                         break
@@ -71,28 +65,26 @@ class TrainingDataGenerator:
         return chunks
 
     def generate_pairs(self, chunk: str, source_file: str, n_pairs: int = 3) -> list[QAPair]:
-        """Call Claude Haiku to generate n_pairs Q&A pairs for a document chunk."""
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=self._api_key)
+        """Ask the local model to generate n_pairs Q&A pairs for a document chunk."""
         try:
-            response = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1024,
-                system=[{"type": "text", "text": _SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-                messages=[{
-                    "role": "user",
-                    "content": _USER_TEMPLATE.format(chunk=chunk[:2000], n_pairs=n_pairs),
-                }],
+            response = ollama.chat(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": _USER_TEMPLATE.format(
+                        chunk=chunk[:2000], n_pairs=n_pairs,
+                    )},
+                ],
             )
-            raw = response.content[0].text.strip()
+            raw = response["message"]["content"].strip()
+            # Strip markdown fences the model might add
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
             pairs_data = json.loads(raw)
             return [
-                QAPair(
-                    question=p["question"],
-                    answer=p["answer"],
-                    source_file=source_file,
-                )
+                QAPair(question=p["question"], answer=p["answer"], source_file=source_file)
                 for p in pairs_data
                 if "question" in p and "answer" in p
             ]
@@ -100,12 +92,7 @@ class TrainingDataGenerator:
             log.warning("generate_pairs_failed", source=source_file, error=str(exc))
             return []
 
-    def run(
-        self,
-        out_path: Path,
-        target_pairs: int = 500,
-        pairs_per_chunk: int = 3,
-    ) -> int:
+    def run(self, out_path: Path, target_pairs: int = 500, pairs_per_chunk: int = 3) -> int:
         """Generate training pairs until target_pairs is reached. Appends to out_path (JSONL)."""
         out_path.parent.mkdir(parents=True, exist_ok=True)
         chunks_needed = (target_pairs + pairs_per_chunk - 1) // pairs_per_chunk
@@ -120,15 +107,13 @@ class TrainingDataGenerator:
             for chunk_text, source_file in chunks:
                 if total >= target_pairs:
                     break
-                pairs = self.generate_pairs(chunk_text, source_file, n_pairs=pairs_per_chunk)
-                for pair in pairs:
-                    record = {
+                for pair in self.generate_pairs(chunk_text, source_file, n_pairs=pairs_per_chunk):
+                    f.write(json.dumps({
                         "messages": [
                             {"role": "user", "content": pair.question},
                             {"role": "assistant", "content": pair.answer},
                         ]
-                    }
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    }, ensure_ascii=False) + "\n")
                     total += 1
                 log.info("pairs_generated", total=total, target=target_pairs)
 

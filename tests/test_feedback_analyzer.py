@@ -93,21 +93,18 @@ class TestFormatters:
 class TestRunAnalysis:
     def test_no_data_returns_early(self, tmp_path: Path) -> None:
         db = tmp_path / "jarvis.db"
-        mock_client = MagicMock()
-        result = run_analysis(db, tmp_path, mock_client, "claude-haiku-4-5-20251001")
+        result = run_analysis(db, tmp_path, model="test-model")
         assert "No feedback" in result
-        mock_client.messages.create.assert_not_called()
 
-    def test_with_data_calls_claude_and_saves(self, tmp_path: Path) -> None:
+    def test_with_data_calls_ollama_and_saves(self, tmp_path: Path) -> None:
         db = tmp_path / "jarvis.db"
         log_feedback(db, "s", "bad response", rating=1, comment="wrong answer")
 
         mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="## Root Cause\nTest improvement report.")]
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
+        mock_response.message.content = "## Root Cause\nTest improvement report."
 
-        result = run_analysis(db, tmp_path, mock_client, "claude-haiku-4-5-20251001")
+        with patch("ollama.chat", return_value=mock_response):
+            result = run_analysis(db, tmp_path, model="test-model")
 
         assert "improvement_suggestions.md" in result
         report_path = tmp_path / "improvement_suggestions.md"
@@ -120,15 +117,16 @@ class TestRunAnalysis:
         db = tmp_path / "jarvis.db"
         log_feedback(db, "s", "bad", rating=1)
 
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="Report v1")]
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
+        mock_v1 = MagicMock()
+        mock_v1.message.content = "Report v1"
+        mock_v2 = MagicMock()
+        mock_v2.message.content = "Report v2"
 
-        run_analysis(db, tmp_path, mock_client, "model")
+        with patch("ollama.chat", return_value=mock_v1):
+            run_analysis(db, tmp_path, model="test-model")
 
-        mock_response.content = [MagicMock(text="Report v2")]
-        run_analysis(db, tmp_path, mock_client, "model")
+        with patch("ollama.chat", return_value=mock_v2):
+            run_analysis(db, tmp_path, model="test-model")
 
         content = (tmp_path / "improvement_suggestions.md").read_text()
         assert "Report v2" in content

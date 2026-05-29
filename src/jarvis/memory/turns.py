@@ -48,18 +48,36 @@ def log_turn(
     """Record one agent turn. Best-effort — never raises."""
     try:
         conn = _get_conn(db_path)
-        conn.execute(
-            """INSERT INTO agent_turns
-               (id, session_id, agent_type, model, input_tokens, output_tokens,
-                tool_calls_json, latency_ms, timestamp)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (str(uuid.uuid4()), session_id, agent_type, model,
-             input_tokens, output_tokens, json.dumps(tool_calls), latency_ms, time.time()),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """INSERT INTO agent_turns
+                   (id, session_id, agent_type, model, input_tokens, output_tokens,
+                    tool_calls_json, latency_ms, timestamp)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (str(uuid.uuid4()), session_id, agent_type, model,
+                 input_tokens, output_tokens, json.dumps(tool_calls), latency_ms, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         pass
+
+
+def prune_old_turns(db_path: Path, retention_days: int) -> int:
+    """Delete agent_turns older than retention_days. Returns number of rows deleted."""
+    cutoff = time.time() - retention_days * 86400
+    try:
+        conn = _get_conn(db_path)
+        try:
+            cur = conn.execute("DELETE FROM agent_turns WHERE timestamp < ?", (cutoff,))
+            deleted = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        return deleted
+    except Exception:
+        return 0
 
 
 def get_turn_stats(
@@ -70,17 +88,19 @@ def get_turn_stats(
     """Return recent turns, newest first. Optionally filter by session."""
     try:
         conn = _get_conn(db_path)
-        if session_id:
-            rows = conn.execute(
-                "SELECT * FROM agent_turns WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
-                (session_id, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM agent_turns ORDER BY timestamp DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        conn.close()
+        try:
+            if session_id:
+                rows = conn.execute(
+                    "SELECT * FROM agent_turns WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+                    (session_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM agent_turns ORDER BY timestamp DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        finally:
+            conn.close()
         result = []
         for r in rows:
             d = dict(r)

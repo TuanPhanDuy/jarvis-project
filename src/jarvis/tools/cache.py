@@ -55,17 +55,77 @@ def get_cached(db_path: Path, tool_name: str, tool_input: dict) -> str | None:
     try:
         conn = _get_conn(db_path)
         key = _cache_key(tool_name, tool_input)
-        row = conn.execute(
-            "SELECT result FROM tool_cache WHERE key = ? AND expires_at > ?",
-            (key, time.time()),
-        ).fetchone()
-        conn.close()
+        try:
+            row = conn.execute(
+                "SELECT result FROM tool_cache WHERE key = ? AND expires_at > ?",
+                (key, time.time()),
+            ).fetchone()
+        finally:
+            conn.close()
         if row:
             log.debug("tool_cache_hit", tool=tool_name)
             return row["result"]
     except Exception:
         pass
     return None
+
+
+def get_cache_stats(db_path: Path) -> dict:
+    """Return live cache statistics: entry counts, expiry breakdown, per-tool counts."""
+    if not db_path.exists():
+        return {"total": 0, "live": 0, "expired": 0, "by_tool": {}}
+    try:
+        now = time.time()
+        conn = _get_conn(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT tool_name, expires_at FROM tool_cache"
+            ).fetchall()
+        finally:
+            conn.close()
+        total = len(rows)
+        live = sum(1 for r in rows if r["expires_at"] > now)
+        by_tool: dict[str, dict] = {}
+        for r in rows:
+            t = r["tool_name"]
+            entry = by_tool.setdefault(t, {"live": 0, "expired": 0})
+            if r["expires_at"] > now:
+                entry["live"] += 1
+            else:
+                entry["expired"] += 1
+        return {"total": total, "live": live, "expired": total - live, "by_tool": by_tool}
+    except Exception:
+        return {"total": 0, "live": 0, "expired": 0, "by_tool": {}}
+
+
+def clear_cache(db_path: Path) -> int:
+    """Delete all cache entries. Returns the number of rows deleted."""
+    if not db_path.exists():
+        return 0
+    try:
+        conn = _get_conn(db_path)
+        try:
+            cur = conn.execute("DELETE FROM tool_cache")
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
+def get_cache_ttls() -> dict[str, int]:
+    """Return a copy of the current per-tool TTL map (seconds). 0 = uncached."""
+    return dict(_TOOL_TTLS)
+
+
+def set_cache_ttl(tool_name: str, ttl_seconds: int) -> dict[str, int]:
+    """Set (or remove) the TTL for a specific tool. ttl_seconds=0 disables caching."""
+    if ttl_seconds > 0:
+        _TOOL_TTLS[tool_name] = ttl_seconds
+    else:
+        _TOOL_TTLS.pop(tool_name, None)
+    return {tool_name: ttl_seconds}
 
 
 def set_cached(db_path: Path, tool_name: str, tool_input: dict, result: str) -> None:
@@ -77,13 +137,15 @@ def set_cached(db_path: Path, tool_name: str, tool_input: dict, result: str) -> 
         now = time.time()
         conn = _get_conn(db_path)
         key = _cache_key(tool_name, tool_input)
-        conn.execute(
-            """INSERT OR REPLACE INTO tool_cache
-               (key, tool_name, result, created_at, expires_at) VALUES (?,?,?,?,?)""",
-            (key, tool_name, result, now, now + ttl),
-        )
-        conn.execute("DELETE FROM tool_cache WHERE expires_at <= ?", (now,))
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO tool_cache
+                   (key, tool_name, result, created_at, expires_at) VALUES (?,?,?,?,?)""",
+                (key, tool_name, result, now, now + ttl),
+            )
+            conn.execute("DELETE FROM tool_cache WHERE expires_at <= ?", (now,))
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         pass

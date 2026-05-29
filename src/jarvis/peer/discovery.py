@@ -81,8 +81,7 @@ class PeerDiscovery:
         try:
             while self._running:
                 try:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(
+                    await asyncio.get_running_loop().run_in_executor(
                         None,
                         lambda: sock.sendto(payload, ("<broadcast>", BROADCAST_PORT)),
                     )
@@ -101,7 +100,7 @@ class PeerDiscovery:
         except Exception:
             return  # port in use or permission denied — discovery disabled
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             while self._running:
                 try:

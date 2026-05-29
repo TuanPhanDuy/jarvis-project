@@ -62,44 +62,45 @@ def handle_update_knowledge_graph(tool_input: dict, db_path: Path) -> str:
             return "ERROR: provide at least one entity or relationship to add."
 
         conn = _get_conn(db_path)
-        now = time.time()
-        added_ents, added_rels = 0, 0
+        try:
+            now = time.time()
+            added_ents, added_rels = 0, 0
+            user_id = tool_input.get("user_id", "shared")
 
-        user_id = tool_input.get("user_id", "shared")
+            for ent in entities:
+                name = ent.get("name", "").strip()
+                if not name:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO entities (name, type, description, user_id, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(name, user_id) DO UPDATE SET
+                        type = excluded.type,
+                        description = CASE WHEN excluded.description != '' THEN excluded.description ELSE description END
+                    """,
+                    (name, ent.get("type", "concept"), ent.get("description", ""), user_id, now),
+                )
+                added_ents += 1
 
-        for ent in entities:
-            name = ent.get("name", "").strip()
-            if not name:
-                continue
-            conn.execute(
-                """
-                INSERT INTO entities (name, type, description, user_id, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(name, user_id) DO UPDATE SET
-                    type = excluded.type,
-                    description = CASE WHEN excluded.description != '' THEN excluded.description ELSE description END
-                """,
-                (name, ent.get("type", "concept"), ent.get("description", ""), user_id, now),
-            )
-            added_ents += 1
+            for rel in relationships:
+                frm = rel.get("from", "").strip()
+                relation = rel.get("relation", "").strip()
+                to = rel.get("to", "").strip()
+                if not frm or not relation or not to:
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO relationships (from_entity, relation, to_entity, notes, user_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (frm, relation, to, rel.get("notes", ""), user_id, now),
+                )
+                added_rels += 1
 
-        for rel in relationships:
-            frm = rel.get("from", "").strip()
-            relation = rel.get("relation", "").strip()
-            to = rel.get("to", "").strip()
-            if not frm or not relation or not to:
-                continue
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO relationships (from_entity, relation, to_entity, notes, user_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (frm, relation, to, rel.get("notes", ""), user_id, now),
-            )
-            added_rels += 1
-
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
         return f"Knowledge graph updated: {added_ents} entity/entities, {added_rels} relationship(s) added."
     except Exception as e:
         return f"ERROR: update_knowledge_graph failed — {e}"
@@ -165,26 +166,26 @@ def handle_query_knowledge_graph(tool_input: dict, db_path: Path) -> str:
         relation_filter = tool_input.get("relation_filter", None) or None
 
         conn = _get_conn(db_path)
+        try:
+            ent_row = conn.execute(
+                "SELECT * FROM entities WHERE name LIKE ? ORDER BY name LIMIT 1", (f"%{entity}%",)
+            ).fetchone()
 
-        ent_row = conn.execute(
-            "SELECT * FROM entities WHERE name LIKE ? ORDER BY name LIMIT 1", (f"%{entity}%",)
-        ).fetchone()
-
-        if depth == 1 and not relation_filter:
-            rels = conn.execute(
-                """
-                SELECT * FROM relationships
-                WHERE from_entity LIKE ? OR to_entity LIKE ?
-                ORDER BY from_entity, relation
-                LIMIT 50
-                """,
-                (f"%{entity}%", f"%{entity}%"),
-            ).fetchall()
-            visited: set[str] = set()
-        else:
-            visited, rels = _bfs_subgraph(conn, entity, depth, relation_filter)
-
-        conn.close()
+            if depth == 1 and not relation_filter:
+                rels = conn.execute(
+                    """
+                    SELECT * FROM relationships
+                    WHERE from_entity LIKE ? OR to_entity LIKE ?
+                    ORDER BY from_entity, relation
+                    LIMIT 50
+                    """,
+                    (f"%{entity}%", f"%{entity}%"),
+                ).fetchall()
+                visited: set[str] = set()
+            else:
+                visited, rels = _bfs_subgraph(conn, entity, depth, relation_filter)
+        finally:
+            conn.close()
 
         if not ent_row and not rels:
             return f"No knowledge found for '{entity}'. Add it with update_knowledge_graph."
@@ -252,15 +253,117 @@ UPDATE_SCHEMA: dict = {
     },
 }
 
+def export_graph(
+    db_path: Path,
+    user_id: str = "shared",
+    limit: int = 500,
+) -> dict:
+    """Export the knowledge graph as {nodes, edges} for visualisation.
+
+    Includes entities belonging to ``user_id`` or the shared namespace.
+    ``limit`` caps the number of nodes returned; edges are included only when
+    both endpoints appear in the node set.
+    """
+    if not db_path.exists():
+        return {"nodes": [], "edges": []}
+    try:
+        conn = _get_conn(db_path)
+        try:
+            entity_rows = conn.execute(
+                "SELECT name, type, description FROM entities "
+                "WHERE user_id IN (?, 'shared') ORDER BY created_at DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+            node_names = {r["name"] for r in entity_rows}
+
+            rel_rows = conn.execute(
+                "SELECT from_entity, relation, to_entity, notes FROM relationships "
+                "WHERE user_id IN (?, 'shared')",
+                (user_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        nodes = [
+            {"id": r["name"], "type": r["type"], "description": r["description"]}
+            for r in entity_rows
+        ]
+        edges = [
+            {
+                "source": r["from_entity"],
+                "relation": r["relation"],
+                "target": r["to_entity"],
+                "notes": r["notes"],
+            }
+            for r in rel_rows
+            if r["from_entity"] in node_names and r["to_entity"] in node_names
+        ]
+        return {"nodes": nodes, "edges": edges}
+    except Exception:
+        return {"nodes": [], "edges": []}
+
+
+def delete_entity(db_path: Path, name: str, user_id: str = "shared") -> bool:
+    """Delete an entity and its relationships by name+user_id. Returns True if found."""
+    if not db_path.exists():
+        return False
+    try:
+        conn = _get_conn(db_path)
+        try:
+            cur = conn.execute(
+                "DELETE FROM entities WHERE name = ? AND user_id = ?", (name, user_id)
+            )
+            deleted = cur.rowcount > 0
+            if deleted:
+                conn.execute(
+                    "DELETE FROM relationships WHERE (from_entity = ? OR to_entity = ?) AND user_id = ?",
+                    (name, name, user_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return deleted
+    except Exception:
+        return False
+
+
+def delete_relationship(
+    db_path: Path,
+    from_entity: str,
+    relation: str,
+    to_entity: str,
+    user_id: str = "shared",
+) -> bool:
+    """Delete a specific relationship triple. Returns True if found."""
+    if not db_path.exists():
+        return False
+    try:
+        conn = _get_conn(db_path)
+        try:
+            cur = conn.execute(
+                "DELETE FROM relationships WHERE from_entity = ? AND relation = ? AND to_entity = ? AND user_id = ?",
+                (from_entity, relation, to_entity, user_id),
+            )
+            deleted = cur.rowcount > 0
+            conn.commit()
+        finally:
+            conn.close()
+        return deleted
+    except Exception:
+        return False
+
+
 def get_recent_entities(db_path: Path, user_id: str = "shared", limit: int = 20) -> list[str]:
     """Return the names of the most recently added entities in the knowledge graph."""
     try:
         conn = _get_conn(db_path)
-        rows = conn.execute(
-            "SELECT name FROM entities WHERE user_id IN (?, 'shared') ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT name FROM entities WHERE user_id IN (?, 'shared') ORDER BY created_at DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        finally:
+            conn.close()
         return [r["name"] for r in rows]
     except Exception:
         return []

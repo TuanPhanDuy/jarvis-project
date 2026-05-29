@@ -5,6 +5,15 @@ from collections.abc import Callable
 from jarvis.agents.base_agent import BaseAgent
 from jarvis.prompts.loader import load_prompt
 
+_MAX_EXTRAS_CHARS = 4_000
+
+
+def _trim_extras(extras: list[str], budget: int) -> list[str]:
+    """Drop lowest-priority extras (from the end) until total fits in budget."""
+    while extras and sum(len(e) for e in extras) > budget:
+        extras.pop()
+    return extras
+
 
 class PlannerAgent(BaseAgent):
     """Orchestrator that delegates to specialist sub-agents when appropriate."""
@@ -63,6 +72,7 @@ class PlannerAgent(BaseAgent):
             except Exception:
                 pass
 
+        _trim_extras(extras, _MAX_EXTRAS_CHARS)
         return base + ("\n\n" + "\n\n".join(extras) if extras else "")
 
     def get_messages(self) -> list[dict]:

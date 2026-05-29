@@ -58,37 +58,73 @@ def log_feedback(
     normalized = _normalize_rating(rating, rating_type)
     msg_hash = hashlib.sha256(response_text.encode()).hexdigest()[:16]
     conn = _get_conn(db_path)
-    conn.execute(
-        "INSERT INTO feedback (session_id, user_id, msg_hash, rating, comment, ts) VALUES (?,?,?,?,?,?)",
-        (session_id, user_id, msg_hash, normalized, comment, time.time()),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            "INSERT INTO feedback (session_id, user_id, msg_hash, rating, comment, ts) VALUES (?,?,?,?,?,?)",
+            (session_id, user_id, msg_hash, normalized, comment, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_feedback_stats(db_path: Path, session_id: str | None = None) -> dict:
     """Return aggregate feedback statistics, optionally scoped to a session."""
     conn = _get_conn(db_path)
-    if session_id:
-        row = conn.execute(
-            "SELECT COUNT(*) as cnt, AVG(rating) as avg_rating FROM feedback WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        recent = conn.execute(
-            "SELECT rating, comment, ts FROM feedback WHERE session_id = ? ORDER BY ts DESC LIMIT 5",
-            (session_id,),
-        ).fetchall()
-    else:
-        row = conn.execute("SELECT COUNT(*) as cnt, AVG(rating) as avg_rating FROM feedback").fetchone()
-        recent = conn.execute(
-            "SELECT rating, comment, ts FROM feedback ORDER BY ts DESC LIMIT 5"
-        ).fetchall()
-    conn.close()
+    try:
+        if session_id:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt, AVG(rating) as avg_rating FROM feedback WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            recent = conn.execute(
+                "SELECT rating, comment, ts FROM feedback WHERE session_id = ? ORDER BY ts DESC LIMIT 5",
+                (session_id,),
+            ).fetchall()
+        else:
+            row = conn.execute("SELECT COUNT(*) as cnt, AVG(rating) as avg_rating FROM feedback").fetchone()
+            recent = conn.execute(
+                "SELECT rating, comment, ts FROM feedback ORDER BY ts DESC LIMIT 5"
+            ).fetchall()
+    finally:
+        conn.close()
     return {
         "total": row["cnt"] or 0,
         "avg_rating": round(row["avg_rating"] or 0, 2),
         "recent": [{"rating": r["rating"], "comment": r["comment"]} for r in recent],
     }
+
+
+def get_feedback_list(
+    db_path: Path,
+    limit: int = 50,
+    offset: int = 0,
+    session_id: str | None = None,
+    user_id: str | None = None,
+) -> list[dict]:
+    """Return paginated raw feedback entries, newest first."""
+    try:
+        conn = _get_conn(db_path)
+        try:
+            where_parts, params = [], []
+            if session_id:
+                where_parts.append("session_id = ?")
+                params.append(session_id)
+            if user_id:
+                where_parts.append("user_id = ?")
+                params.append(user_id)
+            where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+            params += [limit, offset]
+            rows = conn.execute(
+                f"SELECT id, session_id, user_id, rating, comment, ts FROM feedback "
+                f"{where} ORDER BY ts DESC LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 
 def handle_record_feedback(tool_input: dict, db_path: Path) -> str:
@@ -111,10 +147,12 @@ def prune_old_feedback(db_path: Path, retention_days: int) -> int:
     cutoff = time.time() - retention_days * 86400
     try:
         conn = _get_conn(db_path)
-        cur = conn.execute("DELETE FROM feedback WHERE ts < ?", (cutoff,))
-        deleted = cur.rowcount
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.execute("DELETE FROM feedback WHERE ts < ?", (cutoff,))
+            deleted = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
         return deleted
     except Exception:
         return 0

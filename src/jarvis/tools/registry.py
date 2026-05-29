@@ -10,9 +10,11 @@ from jarvis.tools import (
     delegation_batch,
     memory,
     os_command,
+    parallel_map,
     plan_template_tool,
     plan_tool,
     report_writer,
+    team_delegation,
     url_reader,
     web_search,
 )
@@ -151,15 +153,36 @@ def build_planner_registry(
         session_id=session_id,
         user_id=user_id,
     )
+    parallel_map_handler = parallel_map.build_parallel_map_handler(
+        model=model,
+        max_tokens=max_tokens,
+        sub_tool_schemas=base_schemas,
+        sub_tool_registry=base_registry,
+    )
+
+    # Build per-role tool sets for team delegation (TeamAgent filters by role internally)
+    _team_roles = ["team_lead", "frontend", "backend"]
+    role_configs = {role: (base_schemas, base_registry) for role in _team_roles}
+    team_delegation_handler = team_delegation.build_team_delegation_handler(
+        model=model,
+        max_tokens=max_tokens,
+        role_configs=role_configs,
+        allowed_roles=_team_roles,
+    )
+
     planner_schemas = base_schemas + [
         delegation.SCHEMA,
         delegation_batch.SCHEMA,
         plan_tool.SCHEMA,
         plan_template_tool.SCHEMA,
+        parallel_map.SCHEMA,
+        team_delegation.SCHEMA,
     ]
     planner_registry = dict(base_registry)
     planner_registry["delegate_task"] = delegation_handler
     planner_registry["delegate_batch"] = batch_handler
     planner_registry["create_plan"] = plan_handler
     planner_registry["plan_from_template"] = template_handler
+    planner_registry["parallel_map"] = parallel_map_handler
+    planner_registry["delegate_to_team_member"] = team_delegation_handler
     return planner_schemas, planner_registry

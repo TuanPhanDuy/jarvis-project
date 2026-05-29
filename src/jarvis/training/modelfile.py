@@ -5,6 +5,7 @@ so the fine-tuned model is available via `ollama run jarvis-ft`.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -57,11 +58,17 @@ def register_model(gguf_path: Path, model_name: str, system_prompt: str = _SYSTE
 
     log.info("modelfile_written", path=modelfile_path, model=model_name)
 
-    result = subprocess.run(
-        ["ollama", "create", model_name, "-f", modelfile_path],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["ollama", "create", model_name, "-f", modelfile_path],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        try:
+            os.unlink(modelfile_path)
+        except OSError:
+            pass
 
     if result.returncode == 0:
         log.info("model_registered", model=model_name)

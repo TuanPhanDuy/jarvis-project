@@ -5,7 +5,7 @@ generate actionable improvement suggestions saved as a markdown report.
 
 Usage:
     from jarvis.evals.feedback_analyzer import run_analysis
-    run_analysis(db_path, reports_dir, client, fast_model)
+    run_analysis(db_path, reports_dir, model)
 
 Or via CLI:
     jarvis-eval --analyze-feedback
@@ -141,10 +141,11 @@ def _format_failures(items: list[dict]) -> str:
 def run_analysis(
     db_path: Path,
     reports_dir: Path,
-    client,
-    fast_model: str,
+    model: str,
 ) -> str:
     """Run feedback analysis and save improvement report. Returns file path or error."""
+    import ollama
+
     bad_feedback = _fetch_bad_feedback(db_path)
     failures = _fetch_failure_patterns(db_path)
     stats = _fetch_stats(db_path)
@@ -162,19 +163,19 @@ def run_analysis(
         ),
     )
 
-    response = client.messages.create(
-        model=fast_model,
-        max_tokens=1024,
-        system=[{
-            "type": "text",
-            "text": "You are JARVIS's self-improvement module. Be direct and analytical.",
-            "cache_control": {"type": "ephemeral"},
-        }],
-        messages=[{"role": "user", "content": prompt}],
+    response = ollama.chat(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are JARVIS's self-improvement module. Be direct and analytical.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        options={"num_predict": 1024, "temperature": 0.2},
     )
-    report_text = response.content[0].text
+    report_text = response.message.content.strip()
 
-    # Save report
     reports_dir.mkdir(parents=True, exist_ok=True)
     out_path = reports_dir / "improvement_suggestions.md"
     date_str = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())

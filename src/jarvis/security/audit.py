@@ -52,30 +52,97 @@ def log_tool_call(
     """Write one audit entry. Best-effort — never raises."""
     try:
         conn = _get_conn(db_path)
-        conn.execute(
-            """
-            INSERT INTO audit_log
-                (timestamp, session_id, user_id, tool_name, tool_input,
-                 risk_level, approved, approver, result_ok, duration_ms)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                time.time(),
-                session_id,
-                user_id,
-                tool_name,
-                json.dumps(tool_input),
-                risk_level,
-                approved,
-                approver,
-                result_ok,
-                duration_ms,
-            ),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """
+                INSERT INTO audit_log
+                    (timestamp, session_id, user_id, tool_name, tool_input,
+                     risk_level, approved, approver, result_ok, duration_ms)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    time.time(),
+                    session_id,
+                    user_id,
+                    tool_name,
+                    json.dumps(tool_input),
+                    risk_level,
+                    approved,
+                    approver,
+                    result_ok,
+                    duration_ms,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         pass
+
+
+def prune_old_audit(db_path: Path, retention_days: int) -> int:
+    """Delete audit entries older than retention_days. Returns number of rows deleted."""
+    cutoff = time.time() - retention_days * 86400
+    try:
+        conn = _get_conn(db_path)
+        try:
+            cur = conn.execute("DELETE FROM audit_log WHERE timestamp < ?", (cutoff,))
+            deleted = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        return deleted
+    except Exception:
+        return 0
+
+
+def get_audit_stats(db_path: Path, since_ts: float | None = None) -> dict:
+    """Return aggregated audit stats: total calls, approval/denial rates, top tools, risk breakdown."""
+    if not db_path.exists():
+        return {"total_calls": 0, "approved": 0, "denied": 0, "approval_rate": 0.0,
+                "top_tools": [], "risk_breakdown": {}}
+    try:
+        conn = _get_conn(db_path)
+        try:
+            where = "WHERE timestamp >= ?" if since_ts else ""
+            params: list = [since_ts] if since_ts else []
+
+            rows = conn.execute(
+                f"SELECT tool_name, risk_level, approved FROM audit_log {where}", params
+            ).fetchall()
+        finally:
+            conn.close()
+
+        total = len(rows)
+        if total == 0:
+            return {"total_calls": 0, "approved": 0, "denied": 0, "approval_rate": 0.0,
+                    "top_tools": [], "risk_breakdown": {}}
+
+        approved = sum(1 for r in rows if r["approved"])
+        denied = total - approved
+
+        tool_counts: dict[str, int] = {}
+        risk_counts: dict[str, int] = {}
+        for r in rows:
+            tool_counts[r["tool_name"]] = tool_counts.get(r["tool_name"], 0) + 1
+            risk_counts[r["risk_level"]] = risk_counts.get(r["risk_level"], 0) + 1
+
+        top_tools = sorted(
+            [{"tool_name": t, "count": c} for t, c in tool_counts.items()],
+            key=lambda x: x["count"], reverse=True,
+        )[:10]
+
+        return {
+            "total_calls": total,
+            "approved": approved,
+            "denied": denied,
+            "approval_rate": round(approved / total, 4) if total else 0.0,
+            "top_tools": top_tools,
+            "risk_breakdown": risk_counts,
+        }
+    except Exception:
+        return {"total_calls": 0, "approved": 0, "denied": 0, "approval_rate": 0.0,
+                "top_tools": [], "risk_breakdown": {}}
 
 
 def get_recent_audit(
@@ -87,17 +154,19 @@ def get_recent_audit(
     """Return paginated audit entries as plain dicts, newest first."""
     try:
         conn = _get_conn(db_path)
-        if session_id:
-            rows = conn.execute(
-                "SELECT * FROM audit_log WHERE session_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                (session_id, limit, offset),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            ).fetchall()
-        conn.close()
+        try:
+            if session_id:
+                rows = conn.execute(
+                    "SELECT * FROM audit_log WHERE session_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                    (session_id, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+        finally:
+            conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []

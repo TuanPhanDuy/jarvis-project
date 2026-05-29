@@ -24,10 +24,26 @@ def build_delegation_handler(
             return "ERROR: 'task' is required"
 
         from jarvis.agents.coder import CoderAgent
+        from jarvis.agents.consensus import ConsensusAgent
         from jarvis.agents.data_analyst import DataAnalystAgent
         from jarvis.agents.devops import DevOpsAgent
         from jarvis.agents.qa import QAAgent
         from jarvis.agents.researcher import ResearcherAgent
+
+        if agent_type == "consensus":
+            n = int(tool_input.get("n_agents", 3))
+            try:
+                agent = ConsensusAgent(
+                    model=model,
+                    max_tokens=max_tokens,
+                    tool_schemas=sub_tool_schemas,
+                    tool_registry=sub_tool_registry,
+                    n_agents=n,
+                )
+                result = agent.run(task)
+                return f"[CONSENSUS RESULT]\n{result}"
+            except Exception as exc:
+                return f"ERROR: consensus delegation failed — {exc}"
 
         agent_classes = {
             "researcher": ResearcherAgent,
@@ -41,7 +57,7 @@ def build_delegation_handler(
         if AgentClass is None:
             return (
                 f"ERROR: unknown agent_type '{agent_type}'. "
-                f"Valid: {', '.join(agent_classes)}"
+                f"Valid: {', '.join(list(agent_classes) + ['consensus'])}"
             )
 
         try:
@@ -67,14 +83,15 @@ SCHEMA: dict = {
         "- 'coder': write, run, and explain code\n"
         "- 'qa': review code for bugs, edge cases, and quality\n"
         "- 'analyst': query databases/CSV, data analysis, statistics, charts\n"
-        "- 'devops': system diagnostics, shell automation, git, infrastructure"
+        "- 'devops': system diagnostics, shell automation, git, infrastructure\n"
+        "- 'consensus': run N researchers in parallel and return the best-scored answer"
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "agent_type": {
                 "type": "string",
-                "enum": ["researcher", "coder", "qa", "analyst", "devops"],
+                "enum": ["researcher", "coder", "qa", "analyst", "devops", "consensus"],
                 "description": "Which specialist to delegate to.",
             },
             "task": {
@@ -83,6 +100,11 @@ SCHEMA: dict = {
                     "A clear, self-contained task description with all the context needed. "
                     "The sub-agent has no memory of the current conversation."
                 ),
+            },
+            "n_agents": {
+                "type": "integer",
+                "description": "For 'consensus' only: number of parallel researchers (default 3).",
+                "default": 3,
             },
         },
         "required": ["agent_type", "task"],

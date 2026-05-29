@@ -134,21 +134,10 @@ class TestAutoCrawlJob:
 
 
 class TestAutoFinetuneJob:
-    def test_auto_finetune_job_skips_when_no_api_key(self, tmp_path):
-        from jarvis.scheduler.core import _auto_finetune_job
-
-        mock_settings = MagicMock()
-        mock_settings.anthropic_api_key = ""
-
-        with patch("jarvis.scheduler.core.get_settings", return_value=mock_settings):
-            _auto_finetune_job(str(tmp_path / "jarvis.db"), str(tmp_path))
-        # Should return early without error
-
     def test_auto_finetune_job_skips_when_insufficient_new_docs(self, tmp_path):
         from jarvis.scheduler.core import _auto_finetune_job
 
         mock_settings = MagicMock()
-        mock_settings.anthropic_api_key = "test-key"
         mock_settings.auto_training_min_new_docs = 10
         mock_settings.training_data_dir = tmp_path / "training"
 

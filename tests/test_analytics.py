@@ -5,8 +5,9 @@ import time
 
 import pytest
 
-from jarvis.memory.analytics import get_agent_performance, _percentile
+from jarvis.memory.analytics import get_agent_performance, get_tool_performance, _percentile
 from jarvis.memory.turns import log_turn
+from jarvis.security.audit import log_tool_call
 
 
 class TestPercentile:
@@ -88,3 +89,80 @@ class TestGetAgentPerformance:
         result = get_agent_performance(db, agent_type="ResearcherAgent")
         assert len(result) == 1
         assert result[0]["agent_type"] == "ResearcherAgent"
+
+
+class TestGetToolPerformance:
+    def _write_audit(self, db_path, tool_name, result_ok=1, duration_ms=50.0):
+        log_tool_call(
+            db_path=db_path,
+            session_id="s1",
+            tool_name=tool_name,
+            tool_input={},
+            risk_level="low",
+            approved=1,
+            result_ok=result_ok,
+            duration_ms=duration_ms,
+        )
+
+    def test_returns_empty_for_missing_db(self, tmp_path):
+        result = get_tool_performance(tmp_path / "nonexistent.db")
+        assert result == []
+
+    def test_returns_per_tool_stats(self, tmp_path):
+        db = tmp_path / "jarvis.db"
+        for _ in range(3):
+            self._write_audit(db, "web_search")
+        for _ in range(2):
+            self._write_audit(db, "read_file")
+        result = get_tool_performance(db)
+        tool_names = {r["tool_name"] for r in result}
+        assert "web_search" in tool_names
+        assert "read_file" in tool_names
+
+    def test_call_count_correct(self, tmp_path):
+        db = tmp_path / "jarvis.db"
+        for _ in range(5):
+            self._write_audit(db, "delegate_task")
+        result = get_tool_performance(db)
+        assert len(result) == 1
+        assert result[0]["call_count"] == 5
+
+    def test_error_rate_computed(self, tmp_path):
+        db = tmp_path / "jarvis.db"
+        self._write_audit(db, "web_search", result_ok=1)
+        self._write_audit(db, "web_search", result_ok=0)
+        result = get_tool_performance(db)
+        assert len(result) == 1
+        assert result[0]["error_count"] == 1
+        assert result[0]["error_rate"] == 0.5
+
+    def test_zero_error_rate_when_all_pass(self, tmp_path):
+        db = tmp_path / "jarvis.db"
+        for _ in range(4):
+            self._write_audit(db, "read_file", result_ok=1)
+        result = get_tool_performance(db)
+        assert result[0]["error_rate"] == 0.0
+        assert result[0]["error_count"] == 0
+
+    def test_latency_stats_computed(self, tmp_path):
+        db = tmp_path / "jarvis.db"
+        for _ in range(5):
+            self._write_audit(db, "web_search", duration_ms=100.0)
+        result = get_tool_performance(db)
+        assert result[0]["avg_latency_ms"] == 100.0
+        assert result[0]["p95_latency_ms"] == 100.0
+
+    def test_since_ts_filters_old_records(self, tmp_path):
+        db = tmp_path / "jarvis.db"
+        self._write_audit(db, "web_search")
+        future_ts = time.time() + 9999
+        result = get_tool_performance(db, since_ts=future_ts)
+        assert result == []
+
+    def test_required_keys_present(self, tmp_path):
+        db = tmp_path / "jarvis.db"
+        self._write_audit(db, "web_search")
+        result = get_tool_performance(db)
+        assert len(result) == 1
+        for key in ("tool_name", "call_count", "error_count", "error_rate", "avg_latency_ms", "p95_latency_ms"):
+            assert key in result[0]

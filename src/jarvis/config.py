@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     model: str = Field("qwen2.5:14b", alias="JARVIS_MODEL")
     vision_model: str = Field("llava:13b", alias="JARVIS_VISION_MODEL")
     ollama_base_url: str = Field("http://localhost:11434", alias="OLLAMA_BASE_URL")
+    ollama_model: str = Field("llama3.2", alias="OLLAMA_MODEL")
 
     max_tokens: int = Field(8096, alias="JARVIS_MAX_TOKENS")
     fast_model: str = Field("qwen2.5:3b", alias="JARVIS_FAST_MODEL")
@@ -104,6 +105,11 @@ class Settings(BaseSettings):
     training_lora_rank: int = Field(16, alias="JARVIS_TRAINING_LORA_RANK")
     training_lora_epochs: int = Field(3, alias="JARVIS_TRAINING_EPOCHS")
     training_target_pairs: int = Field(500, alias="JARVIS_TRAINING_TARGET_PAIRS")
+
+    # Auto-eval and eval-triggered training
+    auto_eval_enabled: bool = Field(False, alias="JARVIS_AUTO_EVAL")
+    eval_check_cron: str = Field("0 22 * * 6", alias="JARVIS_EVAL_CRON")  # Saturday 22:00 UTC
+    eval_pass_rate_threshold: float = Field(0.8, alias="JARVIS_EVAL_THRESHOLD")
 
     # Auto-training schedule
     auto_training_enabled: bool = Field(False, alias="JARVIS_AUTO_TRAINING")

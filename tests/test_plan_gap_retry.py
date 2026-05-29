@@ -104,7 +104,7 @@ class TestExecutePlanWithGaps:
     def test_gap_fill_appended_when_gaps_found(self, tmp_path, mock_ollama):
         """When _verify_goal returns a gap, _fill_gaps is called and its result is in the output."""
 
-        def fake_run_step(self_inner, agent_type, task):
+        def fake_run_step(self_inner, agent_type, task, **kwargs):
             return "step result"
 
         with patch.object(ExecutorAgent, "_run_step", fake_run_step), \
@@ -128,7 +128,7 @@ class TestExecutePlanWithGaps:
     def test_no_gap_fill_when_verified(self, tmp_path, mock_ollama):
         """When _verify_goal returns empty (ACHIEVED), _fill_gaps is not called."""
 
-        def fake_run_step(self_inner, agent_type, task):
+        def fake_run_step(self_inner, agent_type, task, **kwargs):
             return "step result"
 
         with patch.object(ExecutorAgent, "_run_step", fake_run_step), \

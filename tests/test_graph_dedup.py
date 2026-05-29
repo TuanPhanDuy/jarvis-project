@@ -113,8 +113,8 @@ class TestMergeEntities:
         assert "rlhf" not in names
         assert "RLHF" in names
 
-    def test_returns_zero_for_missing_db(self, tmp_path):
-        assert merge_entities(tmp_path / "no.db", "A", "B") == 0
+    def test_returns_negative_for_missing_db(self, tmp_path):
+        assert merge_entities(tmp_path / "no.db", "A", "B") < 0
 
 
 class TestDeduplicateEntities:

@@ -138,3 +138,172 @@ class TestSummarize:
         results = [self._result(True), self._result(False)]
         s = summarize(results)
         assert s["avg_judge_score"] is None
+
+
+# ── API endpoint tests ────────────────────────────────────────────────────────
+
+import dataclasses
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+import pytest
+from fastapi.testclient import TestClient
+
+
+def _fake_settings(tmp_path: Path) -> MagicMock:
+    s = MagicMock()
+    s.anthropic_api_key = "test-key"
+    s.tavily_api_key = "test-key"
+    s.model = "claude-sonnet-4-6"
+    s.fast_model = "claude-haiku-4-5-20251001"
+    s.max_tokens = 1024
+    s.max_search_calls = 20
+    s.routing_strategy = "always_primary"
+    s.allowed_commands = []
+    s.reports_dir = tmp_path / "reports"
+    s.otel_enabled = False
+    s.auth_enabled = False
+    s.rate_limit_enabled = False
+    s.proactive_enabled = False
+    s.peer_enabled = False
+    s.api_session_ttl_minutes = 60
+    s.memory_retention_days = 90
+    s.jwt_secret = "test-secret"
+    s.chat_rate_limit = "100/minute"
+    s.idle_minutes = 30
+    s.agent_turn_timeout_seconds = 120
+    s.tool_timeout_seconds = 60
+    s.peer_port = 8001
+    s.vision_model = "llava:13b"
+    return s
+
+
+def _make_fake_eval_result(case_id: str = "test_case", passed: bool = True) -> "EvalResult":
+    return EvalResult(
+        case_id=case_id,
+        prompt="test prompt",
+        response="test response",
+        contains_pass=passed,
+        forbidden_pass=passed,
+        overall_pass=passed,
+        latency_s=0.5,
+        cost_usd=0.001,
+    )
+
+
+@pytest.fixture
+def eval_client(tmp_path: Path):
+    settings = _fake_settings(tmp_path)
+    settings.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    with (
+        patch("jarvis.api.server.get_settings", return_value=settings),
+        patch("jarvis.config.get_settings", return_value=settings),
+        patch("jarvis.scheduler.core.start_scheduler"),
+        patch("jarvis.scheduler.core.stop_scheduler"),
+    ):
+        from jarvis.api.server import app
+        with TestClient(app, raise_server_exceptions=True) as c:
+            yield c, settings
+
+
+class TestEvalsEndpoint:
+    def _mock_run_suite(self, results=None):
+        if results is None:
+            results = [_make_fake_eval_result("rlhf_basics", True)]
+        return results
+
+    def test_post_evals_returns_summary(self, eval_client) -> None:
+        client, settings = eval_client
+        fake_results = [_make_fake_eval_result("rlhf_basics", True)]
+
+        with (
+            patch("jarvis.evals.runner.run_suite", return_value=fake_results),
+            patch("jarvis.evals.runner.persist_results"),
+        ):
+            resp = client.post("/api/evals", json={})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total"] == 1
+        assert body["passed"] == 1
+        assert body["pass_rate"] == 1.0
+        assert "run_id" in body
+        assert len(body["results"]) == 1
+
+    def test_post_evals_failed_case_reflected(self, eval_client) -> None:
+        client, settings = eval_client
+        fake_results = [_make_fake_eval_result("bad_case", False)]
+
+        with (
+            patch("jarvis.evals.runner.run_suite", return_value=fake_results),
+            patch("jarvis.evals.runner.persist_results"),
+        ):
+            resp = client.post("/api/evals", json={})
+        body = resp.json()
+        assert body["failed"] == 1
+        assert body["pass_rate"] == 0.0
+        assert body["results"][0]["overall_pass"] is False
+
+    def test_post_evals_passes_tags_to_run_suite(self, eval_client) -> None:
+        client, settings = eval_client
+        fake_results = [_make_fake_eval_result()]
+
+        with (
+            patch("jarvis.evals.runner.run_suite", return_value=fake_results) as mock_run,
+            patch("jarvis.evals.runner.persist_results"),
+        ):
+            client.post("/api/evals", json={"tags": ["ml", "rlhf"]})
+        call_kwargs = mock_run.call_args
+        assert call_kwargs.kwargs["tags_filter"] == ["ml", "rlhf"]
+
+    def test_post_evals_passes_use_judge(self, eval_client) -> None:
+        client, settings = eval_client
+        fake_results = [_make_fake_eval_result()]
+
+        with (
+            patch("jarvis.evals.runner.run_suite", return_value=fake_results) as mock_run,
+            patch("jarvis.evals.runner.persist_results"),
+        ):
+            client.post("/api/evals", json={"use_judge": True})
+        assert mock_run.call_args.kwargs["use_judge"] is True
+
+    def test_get_evals_results_empty_when_no_history(self, eval_client) -> None:
+        client, settings = eval_client
+        resp = client.get("/api/evals/results")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_get_evals_results_returns_written_records(self, eval_client) -> None:
+        client, settings = eval_client
+        # Write a record directly
+        history_path = settings.reports_dir / "eval_history.jsonl"
+        import json as _json
+        record = {
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "git_hash": "abc123",
+            "summary": {"total": 2, "passed": 2, "failed": 0, "pass_rate": 1.0,
+                        "avg_latency_s": 1.0, "total_cost_usd": 0.002, "avg_judge_score": None},
+            "results": [],
+        }
+        history_path.write_text(_json.dumps(record) + "\n")
+
+        resp = client.get("/api/evals/results")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["total"] == 2
+        assert data[0]["git_hash"] == "abc123"
+        assert data[0]["timestamp"] == "2026-01-01T00:00:00+00:00"
+
+    def test_get_evals_results_limit(self, eval_client) -> None:
+        client, settings = eval_client
+        history_path = settings.reports_dir / "eval_history.jsonl"
+        import json as _json
+        summary = {"total": 1, "passed": 1, "failed": 0, "pass_rate": 1.0,
+                   "avg_latency_s": 0.5, "total_cost_usd": 0.001, "avg_judge_score": None}
+        for i in range(5):
+            record = {"timestamp": f"2026-01-0{i+1}T00:00:00+00:00", "git_hash": "", "summary": summary, "results": []}
+            history_path.open("a").write(_json.dumps(record) + "\n")
+
+        resp = client.get("/api/evals/results?limit=3")
+        assert resp.status_code == 200
+        assert len(resp.json()) == 3

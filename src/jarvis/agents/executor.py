@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
+_MAX_PARALLEL_WORKERS = 8
+
 import structlog
 
 from jarvis.agents.step_summarizer import summarize_if_large
@@ -27,10 +29,11 @@ log = structlog.get_logger()
 class PlanStep:
     id: str
     description: str
-    agent_type: str            # "researcher" | "coder" | "qa"
+    agent_type: str            # "researcher" | "coder" | "qa" | "consensus"
     depends_on: list[str] = field(default_factory=list)
     status: str = "pending"    # pending | running | done | failed
     result: str | None = None
+    n_agents: int = 3          # used only when agent_type == "consensus"
 
 
 def _get_conn(db_path: Path) -> sqlite3.Connection:
@@ -126,7 +129,7 @@ class ExecutorAgent:
                 if dep_context:
                     task = f"{task}\n\nContext from previous steps:{dep_context}"
 
-                result = self._run_step(step.agent_type, task)
+                result = self._run_step(step.agent_type, task, n_agents=step.n_agents)
 
                 critique = critic.critique(step.description, result)
                 log.info("plan_step_critiqued", plan_id=plan_id, step_id=step.id,
@@ -146,7 +149,7 @@ class ExecutorAgent:
             if len(level) == 1:
                 _run_level_step(level[0])
             else:
-                with ThreadPoolExecutor(max_workers=len(level)) as pool:
+                with ThreadPoolExecutor(max_workers=min(len(level), _MAX_PARALLEL_WORKERS)) as pool:
                     futures = {pool.submit(_run_level_step, step): step for step in level}
                     for future in as_completed(futures):
                         future.result()
@@ -172,12 +175,28 @@ class ExecutorAgent:
 
         return "\n".join(parts)
 
-    def _run_step(self, agent_type: str, task: str) -> str:
+    def _run_step(self, agent_type: str, task: str, n_agents: int = 3) -> str:
         from jarvis.agents.coder import CoderAgent
+        from jarvis.agents.consensus import ConsensusAgent
         from jarvis.agents.data_analyst import DataAnalystAgent
         from jarvis.agents.devops import DevOpsAgent
         from jarvis.agents.qa import QAAgent
         from jarvis.agents.researcher import ResearcherAgent
+
+        if agent_type == "consensus":
+            try:
+                agent = ConsensusAgent(
+                    model=self._model,
+                    max_tokens=self._max_tokens,
+                    tool_schemas=self._sub_tool_schemas,
+                    tool_registry=self._sub_tool_registry,
+                    n_agents=n_agents,
+                    session_id=self._session_id,
+                    user_id=self._user_id,
+                )
+                return agent.run(task)
+            except Exception as exc:
+                return f"ERROR: consensus step failed — {exc}"
 
         agent_classes = {
             "researcher": ResearcherAgent,
@@ -333,3 +352,68 @@ class ExecutorAgent:
             conn.close()
         except Exception as exc:
             log.error("plan_complete_failed", plan_id=plan_id, error=str(exc))
+
+
+# ── Module-level query helpers ────────────────────────────────────────────────
+
+def _plan_row_to_dict(row) -> dict:
+    import json as _json
+    d = dict(row)
+    try:
+        d["steps"] = _json.loads(d.pop("steps_json", "[]"))
+    except Exception:
+        d["steps"] = []
+    return d
+
+
+def get_plans(
+    db_path: "Path",
+    session_id: str | None = None,
+    user_id: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return plan records ordered by creation time (newest first)."""
+    try:
+        if not db_path.exists():
+            return []
+        conn = _get_conn(db_path)
+        try:
+            where_parts: list[str] = []
+            params: list = []
+            if session_id:
+                where_parts.append("session_id = ?")
+                params.append(session_id)
+            if user_id:
+                where_parts.append("user_id = ?")
+                params.append(user_id)
+            where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+            params.append(limit)
+            rows = conn.execute(
+                f"SELECT id, goal, steps_json, status, created_at, completed_at, session_id, user_id "
+                f"FROM plans {where_clause} ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+        return [_plan_row_to_dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def get_plan(db_path: "Path", plan_id: str) -> dict | None:
+    """Return a single plan record by ID, or None if not found."""
+    try:
+        if not db_path.exists():
+            return None
+        conn = _get_conn(db_path)
+        try:
+            row = conn.execute(
+                "SELECT id, goal, steps_json, status, created_at, completed_at, session_id, user_id "
+                "FROM plans WHERE id = ?",
+                (plan_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return _plan_row_to_dict(row) if row else None
+    except Exception:
+        return None

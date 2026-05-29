@@ -55,6 +55,19 @@ TOOL_RISK_MAP: dict[str, RiskLevel] = {
     "system_info": RiskLevel.SAFE,
     "query_database": RiskLevel.LOW,
     "manage_reminder": RiskLevel.LOW,
+    # Explicitly classified plugins
+    "calendar": RiskLevel.LOW,
+    "execute_code": RiskLevel.HIGH,
+    "image_analysis": RiskLevel.SAFE,
+    "analyze_text": RiskLevel.SAFE,
+    "youtube_summary": RiskLevel.SAFE,
+    "notebooklm": RiskLevel.MEDIUM,
+    "filesystem_search": RiskLevel.SAFE,
+    "git_context": RiskLevel.SAFE,
+    "local_model": RiskLevel.LOW,
+    "ingest_document": RiskLevel.LOW,
+    "research_crawler": RiskLevel.MEDIUM,
+    "generate_tool": RiskLevel.HIGH,
 }
 
 
@@ -178,6 +191,14 @@ def _describe_tool_call(tool_name: str, tool_input: dict) -> str:
         goal = tool_input.get("goal", "")[:80]
         steps = tool_input.get("steps", [])
         return f"Execute {len(steps)}-step plan: {goal}"
+    if tool_name == "delegate_batch":
+        tasks = tool_input.get("tasks", [])
+        agents = ", ".join(t.get("agent_type", "?") for t in tasks[:4])
+        return f"Run {len(tasks)} agents in parallel ({agents})"
+    if tool_name == "parallel_map":
+        topics = tool_input.get("topics", [])
+        template = tool_input.get("task_template", "")[:60]
+        return f"Map {len(topics)} topics in parallel: {template}"
     # Fallback
     parts = [f"{k}={str(v)[:40]}" for k, v in tool_input.items()]
     return f"{tool_name}({', '.join(parts[:3])})"

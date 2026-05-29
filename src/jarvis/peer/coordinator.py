@@ -55,7 +55,7 @@ class PeerCoordinator:
 
         try:
             last_sync = self._synced_peers.get(peer.device_id, 0.0)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             success = await loop.run_in_executor(
                 None,
                 lambda: sync_with_peer(peer.host, peer.port, self._db_path, last_sync),

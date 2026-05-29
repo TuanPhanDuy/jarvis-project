@@ -14,11 +14,11 @@ class ChatRequest(BaseModel):
 
 
 class UsageSummary(BaseModel):
-    input_tokens: int
-    output_tokens: int
-    cache_write_tokens: int
-    cache_read_tokens: int
-    estimated_cost_usd: float
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+    estimated_cost_usd: float = 0.0
 
 
 class ChatResponse(BaseModel):
@@ -202,6 +202,46 @@ class SessionInfo(BaseModel):
     user_id: str | None = None
 
 
+# ── Parallel map ─────────────────────────────────────────────────────────────
+
+class ParallelMapRequest(BaseModel):
+    task_template: str = Field(..., description="Task with {topic} placeholder")
+    topics: list[str] = Field(..., min_length=2, max_length=10)
+    agent_type: str = Field("researcher", description="researcher|coder|qa|analyst|devops")
+    synthesize: bool = Field(True, description="Synthesise all results at the end")
+    timeout_seconds: float | None = Field(None)
+
+
+# ── Evals ────────────────────────────────────────────────────────────────────
+
+class EvalRunRequest(BaseModel):
+    tags: list[str] = Field(default_factory=list, description="Filter cases by tag (empty = all)")
+    use_judge: bool = Field(False, description="Enable Claude-as-judge scoring")
+
+
+class EvalResultItem(BaseModel):
+    case_id: str
+    overall_pass: bool
+    contains_pass: bool
+    forbidden_pass: bool
+    latency_s: float
+    cost_usd: float
+    judge_score: int | None = None
+    error: str = ""
+
+
+class EvalRunResponse(BaseModel):
+    run_id: str
+    total: int
+    passed: int
+    failed: int
+    pass_rate: float
+    avg_latency_s: float
+    total_cost_usd: float
+    avg_judge_score: float | None = None
+    results: list[EvalResultItem]
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 class ComponentStatus(BaseModel):
@@ -214,4 +254,5 @@ class HealthResponse(BaseModel):
     version: str = "0.1.0"
     sessions_active: int = 0
     ws_connections: int = 0
+    pending_approvals: int = 0
     components: dict[str, ComponentStatus] = {}

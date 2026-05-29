@@ -1,9 +1,19 @@
 """Plugin: manage_reminder — set, cancel, and list reminders via APScheduler."""
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
+
+_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+def set_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Called at server startup so _fire_reminder can push to the running loop."""
+    global _event_loop
+    _event_loop = loop
 
 
 def handle(tool_input: dict) -> str:
@@ -92,11 +102,29 @@ def _list_reminders() -> str:
     return "\n".join(lines)
 
 
+def get_reminders() -> list[dict]:
+    """Return pending reminders as a list of dicts for API consumption."""
+    try:
+        sched = _get_scheduler()
+        jobs = [j for j in sched.get_jobs() if j.id.startswith("reminder_")]
+        result = []
+        for job in jobs:
+            next_run = job.next_run_time.isoformat() if job.next_run_time else None
+            title = (job.kwargs or {}).get("title", job.id)
+            result.append({"id": job.id, "title": title, "next_run": next_run})
+        return result
+    except Exception:
+        return []
+
+
 def _fire_reminder(reminder_id: str, title: str) -> None:
     """Called by APScheduler when the reminder fires. Pushes a WsProactive notification."""
     try:
         from jarvis.api.server import _active_websockets
-        import asyncio
+
+        loop = _event_loop
+        if loop is None or not loop.is_running():
+            return
 
         msg = {
             "type": "proactive",
@@ -106,12 +134,7 @@ def _fire_reminder(reminder_id: str, title: str) -> None:
         }
         for ws in list(_active_websockets.values()):
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.call_soon_threadsafe(
-                        asyncio.ensure_future,
-                        ws.send_json(msg),
-                    )
+                loop.call_soon_threadsafe(asyncio.ensure_future, ws.send_json(msg))
             except Exception:
                 pass
     except Exception:

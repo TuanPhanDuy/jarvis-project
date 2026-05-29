@@ -6,7 +6,10 @@ from unittest.mock import patch
 
 import pytest
 
-from jarvis.tools.circuit_breaker import ToolCircuitBreaker, get_breaker, reset_all, _FAILURE_THRESHOLD
+from jarvis.tools.circuit_breaker import (
+    ToolCircuitBreaker, get_breaker, get_all_states, reset_all, reset_breaker,
+    update_breaker_config, _FAILURE_THRESHOLD,
+)
 
 
 class TestToolCircuitBreaker:
@@ -83,3 +86,108 @@ class TestGetBreaker:
         reset_all()
         b2 = get_breaker("web_search")
         assert b1 is not b2
+
+
+class TestGetAllStates:
+    def setup_method(self):
+        reset_all()
+
+    def test_empty_when_no_breakers(self):
+        assert get_all_states() == []
+
+    def test_returns_state_for_each_registered_tool(self):
+        get_breaker("web_search")
+        get_breaker("read_url")
+        states = get_all_states()
+        names = {s["tool"] for s in states}
+        assert names == {"web_search", "read_url"}
+
+    def test_closed_breaker_has_closed_state(self):
+        get_breaker("web_search")
+        states = get_all_states()
+        assert states[0]["state"] == "closed"
+        assert states[0]["opened_at"] is None
+
+    def test_open_breaker_has_open_state(self):
+        cb = get_breaker("web_search")
+        for _ in range(_FAILURE_THRESHOLD):
+            cb.record_failure("web_search")
+        states = get_all_states()
+        assert states[0]["state"] == "open"
+        assert states[0]["opened_at"] is not None
+
+    def test_failure_count_reflected(self):
+        cb = get_breaker("web_search")
+        cb.record_failure("web_search")
+        states = get_all_states()
+        # after 1 failure, count is 1 (not yet open)
+        assert states[0]["failure_count"] == 1
+
+
+class TestResetBreaker:
+    def setup_method(self):
+        reset_all()
+
+    def test_returns_false_for_unknown_tool(self):
+        assert reset_breaker("no_such_tool") is False
+
+    def test_returns_true_for_known_tool(self):
+        get_breaker("web_search")
+        assert reset_breaker("web_search") is True
+
+    def test_resets_open_breaker_to_closed(self):
+        cb = get_breaker("web_search")
+        for _ in range(_FAILURE_THRESHOLD):
+            cb.record_failure("web_search")
+        assert cb.is_open("web_search") is True
+        reset_breaker("web_search")
+        # after reset a new breaker is installed — fetch it
+        new_cb = get_breaker("web_search")
+        assert new_cb.is_open("web_search") is False
+
+    def test_tool_still_tracked_after_reset(self):
+        get_breaker("web_search")
+        reset_breaker("web_search")
+        states = get_all_states()
+        names = {s["tool"] for s in states}
+        assert "web_search" in names
+
+
+class TestUpdateBreakerConfig:
+    def setup_method(self):
+        reset_all()
+
+    def test_creates_breaker_if_absent(self):
+        result = update_breaker_config("new_tool", failure_threshold=5)
+        assert result["tool"] == "new_tool"
+        assert result["failure_threshold"] == 5
+
+    def test_updates_failure_threshold(self):
+        get_breaker("web_search")
+        result = update_breaker_config("web_search", failure_threshold=10)
+        assert result["failure_threshold"] == 10
+
+    def test_updates_reset_timeout_s(self):
+        get_breaker("web_search")
+        result = update_breaker_config("web_search", reset_timeout_s=120.0)
+        assert result["reset_timeout_s"] == 120.0
+
+    def test_updates_both_fields(self):
+        result = update_breaker_config("read_url", failure_threshold=7, reset_timeout_s=30.0)
+        assert result["failure_threshold"] == 7
+        assert result["reset_timeout_s"] == 30.0
+
+    def test_new_threshold_takes_effect(self):
+        update_breaker_config("read_url", failure_threshold=2)
+        cb = get_breaker("read_url")
+        cb.record_failure("read_url")
+        assert cb.is_open("read_url") is False
+        cb.record_failure("read_url")
+        assert cb.is_open("read_url") is True
+
+    def test_returns_current_config_when_no_updates(self):
+        update_breaker_config("read_url", failure_threshold=4, reset_timeout_s=45.0)
+        # calling again with None values returns unchanged config
+        result = update_breaker_config("read_url")
+        assert result["failure_threshold"] == 4
+        assert result["reset_timeout_s"] == 45.0

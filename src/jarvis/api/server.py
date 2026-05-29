@@ -14,6 +14,7 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import collections
 import time
 import uuid
 from collections.abc import Callable
@@ -23,7 +24,8 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from jarvis.api.metrics import (
@@ -40,7 +42,11 @@ from jarvis.api.models import (
     ChatRequest,
     ChatResponse,
     ComponentStatus,
+    EvalRunRequest,
+    EvalRunResponse,
+    EvalResultItem,
     FeedbackRequest,
+    ParallelMapRequest,
     FeedbackStatsResponse,
     HealthResponse,
     ScheduleItem,
@@ -91,6 +97,52 @@ _active_websockets: dict[str, "WebSocket"] = {}
 # Last activity timestamp per session — updated on each incoming WS message
 _session_activity: dict[str, float] = {}
 
+# ── Rate limiting helpers ─────────────────────────────────────────────────────
+
+def _parse_rate(rate_str: str) -> tuple[int, float]:
+    """Parse '30/minute' → (30, 60.0). Also accepts /second and /hour."""
+    count_s, _, period_s = rate_str.partition("/")
+    count = int(count_s.strip())
+    period_map = {"second": 1.0, "minute": 60.0, "hour": 3600.0}
+    window = period_map.get(period_s.strip().lower(), 60.0)
+    return count, window
+
+
+class _RateLimitMiddleware(BaseHTTPMiddleware):
+    """Per-IP sliding-window rate limiter applied to chat endpoints."""
+
+    _RATE_LIMITED_PATHS = {"/api/chat"}
+
+    def __init__(self, app, max_calls: int, window_seconds: float, enabled: bool) -> None:
+        super().__init__(app)
+        self._max_calls = max_calls
+        self._window = window_seconds
+        self._enabled = enabled
+        self._buckets: dict[str, collections.deque] = collections.defaultdict(collections.deque)
+
+    async def dispatch(self, request: Request, call_next):
+        if not self._enabled or request.url.path not in self._RATE_LIMITED_PATHS:
+            return await call_next(request)
+
+        ip = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        bucket = self._buckets[ip]
+
+        while bucket and bucket[0] < now - self._window:
+            bucket.popleft()
+
+        if len(bucket) >= self._max_calls:
+            retry_after = int(self._window - (now - bucket[0])) + 1
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Please slow down."},
+                headers={"Retry-After": str(retry_after)},
+            )
+
+        bucket.append(now)
+        return await call_next(request)
+
+
 # ── App factory ───────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -110,17 +162,7 @@ async def lifespan(app: FastAPI):
         ensure_admin_exists(settings.reports_dir / "jarvis.db")
 
     if settings.rate_limit_enabled:
-        global _limiter
-        try:
-            from slowapi import Limiter, _rate_limit_exceeded_handler
-            from slowapi.errors import RateLimitExceeded
-            from slowapi.util import get_remote_address
-            _limiter = Limiter(key_func=get_remote_address, default_limits=[settings.chat_rate_limit])
-            app.state.limiter = _limiter
-            app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-            log.info("rate_limiting_enabled", limit=settings.chat_rate_limit)
-        except ImportError:
-            log.warning("slowapi_not_installed", hint="pip install slowapi to enable rate limiting")
+        log.info("rate_limiting_enabled", limit=settings.chat_rate_limit)
 
     from jarvis.auth.core import make_auth_dependency
     _require_auth = make_auth_dependency(
@@ -134,6 +176,12 @@ async def lifespan(app: FastAPI):
 
     if settings.peer_enabled:
         await _start_peer_coordinator(settings)
+
+    try:
+        from jarvis.tools.plugins.reminder_manager import set_event_loop as _set_reminder_loop
+        _set_reminder_loop(asyncio.get_running_loop())
+    except Exception:
+        pass
 
     yield
 
@@ -158,9 +206,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_rl_enabled = _os.getenv("JARVIS_RATE_LIMIT_ENABLED", "false").lower() == "true"
+_rl_max, _rl_window = _parse_rate(_os.getenv("JARVIS_CHAT_RATE_LIMIT", "30/minute"))
+app.add_middleware(_RateLimitMiddleware, max_calls=_rl_max, window_seconds=_rl_window, enabled=_rl_enabled)
+
 
 _require_auth = None  # set in lifespan; callable FastAPI dependency
-_limiter = None  # slowapi Limiter, set in lifespan if rate_limit_enabled
+_limiter = None  # unused sentinel — kept for backwards compatibility
 
 
 async def _start_event_bus(settings) -> None:
@@ -170,7 +222,7 @@ async def _start_event_bus(settings) -> None:
     from jarvis.events.autonomous_agent import handle_event
 
     bus = get_event_bus()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _build_autonomous_agent():
         return _build_agent_for_session(settings, researcher_mode=False, session_id="autonomous")
@@ -229,10 +281,12 @@ def _count_user_sessions(settings, user_id: str | None) -> int:
         if not db_path.exists():
             return 0
         conn = sqlite3.connect(str(db_path))
-        row = conn.execute(
-            "SELECT COUNT(DISTINCT session_id) FROM episodes WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        conn.close()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT session_id) FROM episodes WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        finally:
+            conn.close()
         return row[0] if row else 0
     except Exception:
         return 0
@@ -277,12 +331,17 @@ async def _evict_stale_sessions() -> None:
                 from jarvis.memory.feedback import prune_old_feedback
                 from jarvis.memory.failures import prune_old_failures
                 from jarvis.memory.preferences import prune_old_preferences
+                from jarvis.memory.turns import prune_old_turns
+                from jarvis.security.audit import prune_old_audit
                 ep = prune_old_episodes(db_path, retention)
                 fb = prune_old_feedback(db_path, retention)
                 fa = prune_old_failures(db_path, retention)
                 pr = prune_old_preferences(db_path, retention)
-                if ep + fb + fa + pr > 0:
-                    log.info("memory_pruned", episodes=ep, feedback=fb, failures=fa, preferences=pr, retention_days=retention)
+                tu = prune_old_turns(db_path, retention)
+                au = prune_old_audit(db_path, retention)
+                if ep + fb + fa + pr + tu + au > 0:
+                    log.info("memory_pruned", episodes=ep, feedback=fb, failures=fa, preferences=pr,
+                             turns=tu, audit=au, retention_days=retention)
             except Exception as exc:
                 log.warning("memory_prune_error", error=str(exc))
 
@@ -402,8 +461,10 @@ async def health() -> HealthResponse:
         db_path = get_settings().reports_dir / "jarvis.db"
         if db_path.exists():
             conn = sqlite3.connect(str(db_path), timeout=2)
-            conn.execute("SELECT 1").fetchone()
-            conn.close()
+            try:
+                conn.execute("SELECT 1").fetchone()
+            finally:
+                conn.close()
             components["db"] = ComponentStatus(ok=True)
         else:
             components["db"] = ComponentStatus(ok=True, detail="not yet created")
@@ -418,11 +479,19 @@ async def health() -> HealthResponse:
     except Exception as exc:
         components["scheduler"] = ComponentStatus(ok=False, detail=str(exc))
 
+    pending_approvals = sum(
+        len(session["agent"]._approval_gate.get_pending())
+        for session in _sessions.values()
+        if session.get("agent") is not None
+        and session["agent"]._approval_gate is not None
+    )
+
     all_ok = all(c.ok for c in components.values())
     return HealthResponse(
         status="ok" if all_ok else "degraded",
         sessions_active=len(_sessions),
         ws_connections=len(_active_websockets),
+        pending_approvals=pending_approvals,
         components=components,
     )
 
@@ -462,7 +531,7 @@ async def chat(req: ChatRequest, _user=Depends(_auth_dep)) -> ChatResponse:
     messages.append({"role": "user", "content": req.message})
     t0 = time.perf_counter()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     result_holder: list = []
 
     def run():
@@ -492,8 +561,8 @@ async def chat(req: ChatRequest, _user=Depends(_auth_dep)) -> ChatResponse:
     usage = agent.get_usage_summary()
     record_usage(usage)
 
-    _log_episodes(session_id, req.message, text_or_err)
-    _record_spend(session_id, usage["estimated_cost_usd"])
+    _log_episodes(session_id, req.message, text_or_err, user_id=user_id)
+    _record_spend(user_id, usage["estimated_cost_usd"])
     log.info("chat_complete", session_id=session_id, duration_s=round(duration, 2))
     return ChatResponse(
         session_id=session_id,
@@ -505,17 +574,28 @@ async def chat(req: ChatRequest, _user=Depends(_auth_dep)) -> ChatResponse:
 # ── WebSocket ──────────────────────────────────────────────────────────────────
 
 @app.websocket("/api/ws/{session_id}")
-async def websocket_chat(websocket: WebSocket, session_id: str) -> None:
-    """Streaming WebSocket chat. Session persists across reconnections."""
+async def websocket_chat(websocket: WebSocket, session_id: str, token: str | None = None) -> None:
+    """Streaming WebSocket chat. Session persists across reconnections.
+
+    When auth is enabled pass ?token=<jwt> as a query parameter.
+    """
     await websocket.accept()
+
+    settings = get_settings()
+    if settings.auth_enabled:
+        from jarvis.auth.core import verify_token
+        user = verify_token(token or "", settings.jwt_secret) if token else None
+        if user is None:
+            await websocket.send_json(WsError(message="Unauthorized").model_dump())
+            await websocket.close(code=4001)
+            return
+
     ACTIVE_WS_CONNECTIONS.inc()
     _active_websockets[session_id] = websocket
     log.info("ws_connected", session_id=session_id)
 
-    settings = get_settings()
-
     # Build an approval gate that pushes WsApprovalRequest over this WebSocket.
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     from jarvis.security.approval import ApprovalGate, RiskLevel
 
     threshold_name = getattr(settings, "approval_threshold", "medium").upper()
@@ -634,9 +714,10 @@ async def websocket_chat(websocket: WebSocket, session_id: str) -> None:
 
             # Drain chunks until sentinel (with agent turn timeout)
             _ws_timeout = get_settings().agent_turn_timeout_seconds
-            _deadline = asyncio.get_event_loop().time() + _ws_timeout
+            _loop = asyncio.get_running_loop()
+            _deadline = _loop.time() + _ws_timeout
             while True:
-                remaining = _deadline - asyncio.get_event_loop().time()
+                remaining = _deadline - _loop.time()
                 if remaining <= 0:
                     result_holder.append(("err", f"Agent turn timed out after {_ws_timeout}s", messages))
                     break
@@ -658,8 +739,8 @@ async def websocket_chat(websocket: WebSocket, session_id: str) -> None:
                 session["messages"] = updated_messages
                 usage = agent.get_usage_summary()
                 record_usage(usage)
-                _log_episodes(session_id, req.message, response_text)
-                _record_spend(session_id, usage["estimated_cost_usd"])
+                _log_episodes(session_id, req.message, response_text, user_id=_user_id)
+                _record_spend(_user_id, usage["estimated_cost_usd"])
                 await websocket.send_json(
                     WsDone(text=response_text, usage=UsageSummary(**usage)).model_dump()
                 )
@@ -680,23 +761,23 @@ async def websocket_chat(websocket: WebSocket, session_id: str) -> None:
 
 # ── Episodic logging helper ────────────────────────────────────────────────────
 
-def _log_episodes(session_id: str, user_msg: str, assistant_reply: str) -> None:
+def _log_episodes(session_id: str, user_msg: str, assistant_reply: str, user_id: str = "anonymous") -> None:
     """Persist user + assistant turn to episodic memory. Best-effort."""
     try:
         from jarvis.memory.episodic import log_episode
         db_path = get_settings().reports_dir / "jarvis.db"
-        log_episode(db_path, session_id, "user", user_msg)
-        log_episode(db_path, session_id, "assistant", assistant_reply)
+        log_episode(db_path, session_id, "user", user_msg, user_id=user_id)
+        log_episode(db_path, session_id, "assistant", assistant_reply, user_id=user_id)
     except Exception:
         pass
 
 
-def _record_spend(session_id: str, cost_usd: float) -> None:
-    """Record per-session token spend for budget tracking. Best-effort."""
+def _record_spend(user_id: str, cost_usd: float) -> None:
+    """Record per-user token spend for budget tracking. Best-effort."""
     try:
         from jarvis.api.budget import record_spend
         db_path = get_settings().reports_dir / "jarvis.db"
-        record_spend(db_path, session_id, cost_usd)
+        record_spend(db_path, user_id, cost_usd)
     except Exception:
         pass
 
@@ -721,10 +802,24 @@ async def get_feedback(session_id: str) -> FeedbackStatsResponse:
     return FeedbackStatsResponse(**stats)
 
 
+@app.get("/api/feedback")
+async def list_feedback(
+    limit: int = 50,
+    offset: int = 0,
+    session_id: str | None = None,
+    user_id: str | None = None,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return paginated raw feedback entries, newest first. Filter by session_id or user_id."""
+    from jarvis.memory.feedback import get_feedback_list
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_feedback_list(db_path, limit=limit, offset=offset, session_id=session_id, user_id=user_id)
+
+
 # ── Budget endpoints ───────────────────────────────────────────────────────────
 
 @app.put("/api/budget/{user_id}", response_model=BudgetStatusResponse)
-async def set_budget(user_id: str, req: BudgetRequest) -> BudgetStatusResponse:
+async def set_budget(user_id: str, req: BudgetRequest, _user=Depends(_auth_dep)) -> BudgetStatusResponse:
     """Set monthly USD spending budget for a user (0 = unlimited)."""
     from jarvis.api.budget import get_budget_status, set_budget as _set_budget
     db_path = get_settings().reports_dir / "jarvis.db"
@@ -733,11 +828,21 @@ async def set_budget(user_id: str, req: BudgetRequest) -> BudgetStatusResponse:
 
 
 @app.get("/api/budget/{user_id}", response_model=BudgetStatusResponse)
-async def get_budget(user_id: str) -> BudgetStatusResponse:
+async def get_budget(user_id: str, _user=Depends(_auth_dep)) -> BudgetStatusResponse:
     """Get current spending and remaining budget for a user."""
     from jarvis.api.budget import get_budget_status
     db_path = get_settings().reports_dir / "jarvis.db"
     return BudgetStatusResponse(**get_budget_status(db_path, user_id))
+
+
+@app.get("/api/budget")
+async def list_all_budgets(_user=Depends(_auth_dep)) -> list[dict]:
+    """Return budget status for all users. Admin view."""
+    from jarvis.api.budget import get_all_budget_statuses
+    db_path = get_settings().reports_dir / "jarvis.db"
+    if not db_path.exists():
+        return []
+    return get_all_budget_statuses(db_path)
 
 
 # ── Auth endpoints ────────────────────────────────────────────────────────────
@@ -768,10 +873,44 @@ async def login(req: TokenRequest) -> TokenResponse:
     return TokenResponse(access_token=token, expires_in=settings.jwt_expire_minutes * 60)
 
 
+# ── User management endpoints ─────────────────────────────────────────────────
+
+@app.get("/api/users")
+async def list_users(_user=Depends(_auth_dep)) -> list[dict]:
+    """List all registered users. Admin endpoint."""
+    from jarvis.auth.core import list_users as _list_users
+    db_path = get_settings().reports_dir / "jarvis.db"
+    if not db_path.exists():
+        return []
+    return _list_users(db_path)
+
+
+@app.delete("/api/users/{username}", status_code=204)
+async def delete_user(username: str, _user=Depends(_auth_dep)) -> None:
+    """Delete a user account by username."""
+    from jarvis.auth.core import delete_user as _delete_user
+    db_path = get_settings().reports_dir / "jarvis.db"
+    if not _delete_user(db_path, username):
+        raise HTTPException(status_code=404, detail=f"User '{username}' not found.")
+
+
+@app.patch("/api/users/{username}/role")
+async def update_user_role(username: str, body: dict, _user=Depends(_auth_dep)) -> dict:
+    """Update a user's role. Valid roles: admin, user, readonly."""
+    from jarvis.auth.core import update_user_role as _update_role
+    role = body.get("role", "")
+    if role not in ("admin", "user", "readonly"):
+        raise HTTPException(status_code=422, detail="role must be one of: admin, user, readonly")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    if not _update_role(db_path, username, role):
+        raise HTTPException(status_code=404, detail=f"User '{username}' not found.")
+    return {"username": username, "role": role}
+
+
 # ── Schedule endpoints ─────────────────────────────────────────────────────────
 
 @app.post("/api/schedules", response_model=ScheduleResponse)
-async def create_schedule(req: ScheduleRequest) -> ScheduleResponse:
+async def create_schedule(req: ScheduleRequest, _user=Depends(_auth_dep)) -> ScheduleResponse:
     """Create a recurring proactive agent job (research or monitor)."""
     from apscheduler.triggers.cron import CronTrigger
     from jarvis.scheduler.core import JOB_FUNCTIONS, get_scheduler
@@ -807,7 +946,7 @@ async def create_schedule(req: ScheduleRequest) -> ScheduleResponse:
 
 
 @app.get("/api/schedules", response_model=list[ScheduleItem])
-async def list_schedules() -> list[ScheduleItem]:
+async def list_schedules(_user=Depends(_auth_dep)) -> list[ScheduleItem]:
     """List all active scheduled jobs."""
     from jarvis.scheduler.core import JOB_FUNCTIONS, get_scheduler
 
@@ -827,8 +966,30 @@ async def list_schedules() -> list[ScheduleItem]:
     return items
 
 
+@app.get("/api/schedules/{job_id}", response_model=ScheduleItem)
+async def get_schedule(job_id: str, _user=Depends(_auth_dep)) -> ScheduleItem:
+    """Return details for a single scheduled job by ID."""
+    from jarvis.scheduler.core import JOB_FUNCTIONS, get_scheduler
+
+    scheduler = get_scheduler()
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="Scheduler not running.")
+
+    job = scheduler.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    func_to_type = {v.__name__: k for k, v in JOB_FUNCTIONS.items()}
+    job_type = func_to_type.get(job.func.__name__, job.func.__name__)
+    kwargs = job.kwargs or {}
+    subject = kwargs.get("topic") or kwargs.get("query") or ""
+    next_run = job.next_run_time.isoformat() if job.next_run_time else None
+    return ScheduleItem(job_id=job.id, job_type=job_type, subject=subject,
+                        cron=str(job.trigger), next_run=next_run)
+
+
 @app.delete("/api/schedules/{job_id}", response_model=ScheduleResponse)
-async def delete_schedule(job_id: str) -> ScheduleResponse:
+async def delete_schedule(job_id: str, _user=Depends(_auth_dep)) -> ScheduleResponse:
     """Remove a scheduled job by ID."""
     from apscheduler.jobstores.base import JobLookupError
     from jarvis.scheduler.core import get_scheduler
@@ -844,10 +1005,37 @@ async def delete_schedule(job_id: str) -> ScheduleResponse:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
 
 
+@app.patch("/api/schedules/{job_id}", response_model=ScheduleResponse)
+async def reschedule_job(job_id: str, body: dict, _user=Depends(_auth_dep)) -> ScheduleResponse:
+    """Update the cron trigger of an existing scheduled job."""
+    from apscheduler.jobstores.base import JobLookupError
+    from jarvis.scheduler.core import _parse_cron, get_scheduler
+
+    cron = body.get("cron", "")
+    if not cron:
+        raise HTTPException(status_code=422, detail="'cron' field is required (5-field cron expression)")
+
+    scheduler = get_scheduler()
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="Scheduler not running.")
+
+    try:
+        trigger = _parse_cron(cron)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    try:
+        scheduler.reschedule_job(job_id, trigger=trigger)
+        log.info("schedule_updated", job_id=job_id, cron=cron)
+        return ScheduleResponse(job_id=job_id, message=f"Job rescheduled (cron: {cron} UTC).")
+    except JobLookupError:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+
 # ── Audit endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/api/feedback/stats")
-async def get_feedback_stats(session_id: str | None = None) -> dict:
+async def get_feedback_stats(session_id: str | None = None, _user=Depends(_auth_dep)) -> dict:
     """Return aggregate feedback statistics."""
     from jarvis.memory.feedback import get_feedback_stats as _get_stats
     db_path = get_settings().reports_dir / "jarvis.db"
@@ -855,7 +1043,7 @@ async def get_feedback_stats(session_id: str | None = None) -> dict:
 
 
 @app.get("/api/improvement-report")
-async def get_improvement_report() -> dict:
+async def get_improvement_report(_user=Depends(_auth_dep)) -> dict:
     """Return the latest self-improvement analysis report content."""
     settings = get_settings()
     report_path = settings.reports_dir / "improvement_suggestions.md"
@@ -866,7 +1054,8 @@ async def get_improvement_report() -> dict:
 
 @app.get("/api/audit")
 async def get_audit(
-    limit: int = 50, offset: int = 0, session_id: str | None = None
+    limit: int = 50, offset: int = 0, session_id: str | None = None,
+    _user=Depends(_auth_dep),
 ) -> list[dict]:
     """Return paginated tool-call audit log entries, newest first."""
     from jarvis.security.audit import get_recent_audit
@@ -874,9 +1063,21 @@ async def get_audit(
     return get_recent_audit(db_path, limit=limit, offset=offset, session_id=session_id)
 
 
+@app.get("/api/audit/stats")
+async def get_audit_stats_endpoint(
+    since_ts: float | None = None,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Return aggregated audit statistics: total calls, approval rate, top tools, risk breakdown."""
+    from jarvis.security.audit import get_audit_stats
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_audit_stats(db_path, since_ts=since_ts)
+
+
 @app.get("/api/turns")
 async def get_agent_turns(
-    limit: int = 50, session_id: str | None = None
+    limit: int = 50, session_id: str | None = None,
+    _user=Depends(_auth_dep),
 ) -> list[dict]:
     """Return recent per-agent-turn records (tokens, latency, model, tool calls)."""
     from jarvis.memory.turns import get_turn_stats
@@ -884,10 +1085,23 @@ async def get_agent_turns(
     return get_turn_stats(db_path, session_id=session_id, limit=limit)
 
 
+@app.get("/api/failures")
+async def get_failure_patterns_endpoint(
+    tool_name: str | None = None,
+    limit: int = 50,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return tool failure patterns grouped by tool + error message, sorted by frequency."""
+    from jarvis.memory.failures import get_failure_patterns
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_failure_patterns(db_path, tool_name=tool_name, limit=limit)
+
+
 @app.get("/api/analytics/agents")
 async def get_agent_analytics(
     agent_type: str | None = None,
     hours: float = 24,
+    _user=Depends(_auth_dep),
 ) -> list[dict]:
     """Return per-agent performance stats: latency percentiles, token usage, call counts."""
     import time
@@ -897,8 +1111,156 @@ async def get_agent_analytics(
     return get_agent_performance(db_path, agent_type=agent_type, since_ts=since_ts)
 
 
+@app.get("/api/analytics/tools")
+async def get_tool_analytics(
+    hours: float = 24,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return per-tool performance stats derived from audit_log: error rate, latency."""
+    import time
+    from jarvis.memory.analytics import get_tool_performance
+    db_path = get_settings().reports_dir / "jarvis.db"
+    since_ts = time.time() - hours * 3600
+    return get_tool_performance(db_path, since_ts=since_ts)
+
+
+@app.get("/api/memory/stats")
+async def get_memory_stats(_user=Depends(_auth_dep)) -> dict:
+    """Return row counts for each memory subsystem (episodes, feedback, preferences, failures)."""
+    import sqlite3
+    db_path = get_settings().reports_dir / "jarvis.db"
+    if not db_path.exists():
+        return {"episodes": 0, "feedback": 0, "preferences": 0, "failures": 0}
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            def _count(table: str) -> int:
+                try:
+                    return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                except Exception:
+                    return 0
+            return {
+                "episodes": _count("episodes"),
+                "feedback": _count("feedback"),
+                "preferences": _count("user_preferences"),
+                "failures": _count("tool_failures"),
+            }
+        finally:
+            conn.close()
+    except Exception:
+        return {"episodes": 0, "feedback": 0, "preferences": 0, "failures": 0}
+
+
+# ── Preferences endpoints ────────────────────────────────────────────────────
+
+@app.get("/api/preferences/{user_id}")
+async def get_user_preferences(user_id: str, _user=Depends(_auth_dep)) -> list[dict]:
+    """Return all stored preferences for a user with full metadata."""
+    from jarvis.memory.preferences import get_preferences_with_metadata
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_preferences_with_metadata(db_path, user_id)
+
+
+@app.delete("/api/preferences/{user_id}/{category}/{key}", status_code=204)
+async def delete_user_preference(
+    user_id: str, category: str, key: str, _user=Depends(_auth_dep)
+) -> None:
+    """Delete a single preference entry. Returns 404 if the entry does not exist."""
+    from jarvis.memory.preferences import delete_preference
+    db_path = get_settings().reports_dir / "jarvis.db"
+    deleted = delete_preference(db_path, user_id, category, key)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Preference '{category}/{key}' not found for user '{user_id}'.")
+
+
+# ── Knowledge graph export ───────────────────────────────────────────────────
+
+@app.get("/api/knowledge-graph/export")
+async def export_knowledge_graph(
+    user_id: str = "shared",
+    limit: int = 500,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Export the full knowledge graph as {nodes, edges} for D3/Cytoscape visualisation."""
+    from jarvis.memory.graph import export_graph
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return export_graph(db_path, user_id=user_id, limit=limit)
+
+
+# ── Cache management endpoints ───────────────────────────────────────────────
+
+@app.get("/api/cache/stats")
+async def get_cache_stats_endpoint(_user=Depends(_auth_dep)) -> dict:
+    """Return tool-cache statistics: live entry count, expired count, per-tool breakdown."""
+    from jarvis.tools.cache import get_cache_stats
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_cache_stats(db_path)
+
+
+@app.delete("/api/cache")
+async def clear_cache_endpoint(_user=Depends(_auth_dep)) -> dict:
+    """Flush all cached tool results. Returns the number of entries deleted."""
+    from jarvis.tools.cache import clear_cache
+    db_path = get_settings().reports_dir / "jarvis.db"
+    deleted = clear_cache(db_path)
+    return {"deleted": deleted}
+
+
+@app.get("/api/tools/cache/ttls")
+async def get_cache_ttls_endpoint(_user=Depends(_auth_dep)) -> dict:
+    """Return the current per-tool cache TTL map (seconds). Tools absent are uncached."""
+    from jarvis.tools.cache import get_cache_ttls
+    return get_cache_ttls()
+
+
+@app.put("/api/tools/cache/ttls/{tool_name}")
+async def set_cache_ttl_endpoint(tool_name: str, body: dict, _user=Depends(_auth_dep)) -> dict:
+    """Set the cache TTL (seconds) for a specific tool. Pass ttl_seconds=0 to disable caching."""
+    from jarvis.tools.cache import set_cache_ttl
+    ttl = body.get("ttl_seconds")
+    if ttl is None:
+        raise HTTPException(status_code=422, detail="'ttl_seconds' is required")
+    if not isinstance(ttl, int) or ttl < 0:
+        raise HTTPException(status_code=422, detail="'ttl_seconds' must be a non-negative integer")
+    return set_cache_ttl(tool_name, ttl)
+
+
+# ── Circuit breaker endpoints ─────────────────────────────────────────────────
+
+@app.get("/api/tools/circuit-breakers")
+async def list_circuit_breakers(_user=Depends(_auth_dep)) -> list[dict]:
+    """Return the current state of every tool circuit breaker."""
+    from jarvis.tools.circuit_breaker import get_all_states
+    return get_all_states()
+
+
+@app.delete("/api/tools/circuit-breakers/{tool_name}")
+async def reset_circuit_breaker(tool_name: str, _user=Depends(_auth_dep)) -> dict:
+    """Reset a tool's circuit breaker back to CLOSED state."""
+    from jarvis.tools.circuit_breaker import reset_breaker
+    found = reset_breaker(tool_name)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"No breaker found for tool '{tool_name}'")
+    return {"tool": tool_name, "state": "closed"}
+
+
+@app.patch("/api/tools/circuit-breakers/{tool_name}")
+async def update_circuit_breaker(tool_name: str, body: dict, _user=Depends(_auth_dep)) -> dict:
+    """Update failure_threshold and/or reset_timeout_s for a tool's circuit breaker."""
+    from jarvis.tools.circuit_breaker import update_breaker_config
+    failure_threshold = body.get("failure_threshold")
+    reset_timeout_s = body.get("reset_timeout_s")
+    if failure_threshold is None and reset_timeout_s is None:
+        raise HTTPException(status_code=422, detail="Provide at least one of: failure_threshold, reset_timeout_s")
+    if failure_threshold is not None and (not isinstance(failure_threshold, int) or failure_threshold < 1):
+        raise HTTPException(status_code=422, detail="failure_threshold must be a positive integer")
+    if reset_timeout_s is not None and (not isinstance(reset_timeout_s, (int, float)) or reset_timeout_s <= 0):
+        raise HTTPException(status_code=422, detail="reset_timeout_s must be a positive number")
+    return update_breaker_config(tool_name, failure_threshold=failure_threshold, reset_timeout_s=reset_timeout_s)
+
+
 @app.get("/api/approval/pending")
-async def get_pending_approvals(session_id: str) -> list[dict]:
+async def get_pending_approvals(session_id: str, _user=Depends(_auth_dep)) -> list[dict]:
     """Return pending approval requests for a session."""
     session = _sessions.get(session_id)
     if not session or not session.get("approval_gate"):
@@ -909,7 +1271,7 @@ async def get_pending_approvals(session_id: str) -> list[dict]:
 # ── Session management endpoints ─────────────────────────────────────────────
 
 @app.get("/api/sessions", response_model=list[SessionInfo])
-async def list_sessions() -> list[SessionInfo]:
+async def list_sessions(_user=Depends(_auth_dep)) -> list[SessionInfo]:
     """List all currently active in-memory sessions."""
     return [
         SessionInfo(
@@ -923,7 +1285,7 @@ async def list_sessions() -> list[SessionInfo]:
 
 
 @app.get("/api/sessions/{session_id}", response_model=SessionInfo)
-async def get_session(session_id: str) -> SessionInfo:
+async def get_session(session_id: str, _user=Depends(_auth_dep)) -> SessionInfo:
     """Return metadata for a specific session."""
     session = _sessions.get(session_id)
     if session is None:
@@ -937,7 +1299,7 @@ async def get_session(session_id: str) -> SessionInfo:
 
 
 @app.delete("/api/sessions/{session_id}", status_code=204)
-async def delete_session(session_id: str) -> None:
+async def delete_session(session_id: str, _user=Depends(_auth_dep)) -> None:
     """Evict a session from memory, freeing its agent and message history."""
     if session_id not in _sessions:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
@@ -945,6 +1307,32 @@ async def delete_session(session_id: str) -> None:
     _active_websockets.pop(session_id, None)
     _session_activity.pop(session_id, None)
     log.info("session_deleted", session_id=session_id)
+
+
+# ── Plan history endpoints ────────────────────────────────────────────────────
+
+@app.get("/api/plans")
+async def list_plans(
+    session_id: str | None = None,
+    user_id: str | None = None,
+    limit: int = 50,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return plan execution records, newest first. Filter by session_id or user_id."""
+    from jarvis.agents.executor import get_plans
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_plans(db_path, session_id=session_id, user_id=user_id, limit=limit)
+
+
+@app.get("/api/plans/{plan_id}")
+async def get_plan_by_id(plan_id: str, _user=Depends(_auth_dep)) -> dict:
+    """Return a single plan record by ID including all steps."""
+    from jarvis.agents.executor import get_plan
+    db_path = get_settings().reports_dir / "jarvis.db"
+    plan = get_plan(db_path, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail=f"Plan '{plan_id}' not found.")
+    return plan
 
 
 # ── Peer coordination endpoints ───────────────────────────────────────────────
@@ -978,7 +1366,7 @@ async def receive_peer_sync(request: Request) -> dict:
 
 
 @app.get("/api/peer/delta")
-async def get_peer_delta(since_ts: float = 0.0) -> dict:
+async def get_peer_delta(since_ts: float = 0.0, _user=Depends(_auth_dep)) -> dict:
     """Serve local graph delta to a requesting peer (since the given timestamp)."""
     from jarvis.edge.sync import export_delta
 
@@ -1031,6 +1419,35 @@ async def voice_status() -> dict:
     return {"active": _voice_active}
 
 
+@app.get("/api/reminders")
+async def list_reminders(_user=Depends(_auth_dep)) -> list[dict]:
+    """Return all pending reminders with their next scheduled fire time."""
+    from jarvis.tools.plugins.reminder_manager import get_reminders
+    return get_reminders()
+
+
+# ── Config introspection endpoint ─────────────────────────────────────────────
+
+@app.get("/api/config")
+async def get_config(_user=Depends(_auth_dep)) -> dict:
+    """Return the current runtime configuration (feature flags and model settings). Secrets are redacted."""
+    s = get_settings()
+    return {
+        "auth_enabled": s.auth_enabled,
+        "proactive_enabled": s.proactive_enabled,
+        "peer_enabled": s.peer_enabled,
+        "rate_limit_enabled": s.rate_limit_enabled,
+        "otel_enabled": s.otel_enabled,
+        "model": s.model,
+        "fast_model": s.fast_model,
+        "routing_strategy": s.routing_strategy,
+        "memory_retention_days": s.memory_retention_days,
+        "auto_training_enabled": getattr(s, "auto_training_enabled", False),
+        "max_tokens": s.max_tokens,
+        "max_search_calls": s.max_search_calls,
+    }
+
+
 # ── Memory browser endpoints ───────────────────────────────────────────────────
 
 @app.get("/api/memory/episodes")
@@ -1038,58 +1455,149 @@ async def get_memory_episodes(
     session_id: str | None = None,
     limit: int = 20,
     offset: int = 0,
+    _user=Depends(_auth_dep),
 ) -> list[dict]:
     """Return paginated episodic memory entries."""
     from jarvis.memory.episodic import _get_conn
     db_path = get_settings().reports_dir / "jarvis.db"
     try:
         conn = _get_conn(db_path)
-        if session_id:
-            rows = conn.execute(
-                "SELECT session_id, user_id, role, content, timestamp FROM episodes "
-                "WHERE session_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                (session_id, limit, offset),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT session_id, user_id, role, content, timestamp FROM episodes "
-                "ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            ).fetchall()
-        conn.close()
+        try:
+            if session_id:
+                rows = conn.execute(
+                    "SELECT session_id, user_id, role, content, timestamp FROM episodes "
+                    "WHERE session_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                    (session_id, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT session_id, user_id, role, content, timestamp FROM episodes "
+                    "ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+        finally:
+            conn.close()
         return [dict(r) for r in rows]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/memory/graph")
-async def get_memory_graph(entity: str | None = None, limit: int = 50) -> list[dict]:
+async def get_memory_graph(entity: str | None = None, limit: int = 50, _user=Depends(_auth_dep)) -> list[dict]:
     """Return knowledge graph entities and their relationships."""
     db_path = get_settings().reports_dir / "jarvis.db"
+    if not db_path.exists():
+        return []
     try:
         import sqlite3
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
-        if entity:
-            rows = conn.execute(
-                "SELECT * FROM knowledge_graph WHERE subject LIKE ? OR object LIKE ? LIMIT ?",
-                (f"%{entity}%", f"%{entity}%", limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM knowledge_graph ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+        try:
+            if entity:
+                ents = conn.execute(
+                    "SELECT name, type, description, user_id, created_at FROM entities "
+                    "WHERE name LIKE ? LIMIT ?",
+                    (f"%{entity}%", limit),
+                ).fetchall()
+                rels = conn.execute(
+                    "SELECT from_entity, relation, to_entity, notes, user_id, created_at "
+                    "FROM relationships WHERE from_entity LIKE ? OR to_entity LIKE ? LIMIT ?",
+                    (f"%{entity}%", f"%{entity}%", limit),
+                ).fetchall()
+            else:
+                ents = conn.execute(
+                    "SELECT name, type, description, user_id, created_at FROM entities "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                rels = conn.execute(
+                    "SELECT from_entity, relation, to_entity, notes, user_id, created_at "
+                    "FROM relationships ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        finally:
+            conn.close()
+        return [
+            {"record_type": "entity", **dict(r)} for r in ents
+        ] + [
+            {"record_type": "relationship", **dict(r)} for r in rels
+        ]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/memory/episodes/search")
+async def search_memory_episodes(
+    q: str,
+    user_id: str | None = None,
+    limit: int = 20,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Full-text search episodic memory by keyword."""
+    from jarvis.memory.episodic import search_episodes
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return search_episodes(db_path, q, limit=limit, user_id=user_id)
+
+
+@app.delete("/api/memory/episodes", status_code=200)
+async def delete_memory_episodes(
+    session_id: str | None = None,
+    user_id: str | None = None,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Delete episodes filtered by session_id and/or user_id. At least one filter required."""
+    if not session_id and not user_id:
+        raise HTTPException(status_code=400, detail="Provide at least one of: session_id, user_id")
+    from jarvis.memory.episodic import delete_episodes
+    db_path = get_settings().reports_dir / "jarvis.db"
+    deleted = delete_episodes(db_path, session_id=session_id, user_id=user_id)
+    return {"deleted": deleted}
+
+
+@app.get("/api/memory/summaries/{user_id}")
+async def get_session_summaries(
+    user_id: str,
+    limit: int = 20,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return session summaries for a user, newest first."""
+    from jarvis.memory.preferences import get_session_summaries_full
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_session_summaries_full(db_path, user_id, limit=limit)
+
+
+@app.delete("/api/knowledge-graph/entities/{name}", status_code=204)
+async def delete_knowledge_graph_entity(
+    name: str,
+    user_id: str = "shared",
+    _user=Depends(_auth_dep),
+) -> None:
+    """Delete a knowledge graph entity (and its relationships) by name."""
+    from jarvis.memory.graph import delete_entity
+    db_path = get_settings().reports_dir / "jarvis.db"
+    if not delete_entity(db_path, name, user_id=user_id):
+        raise HTTPException(status_code=404, detail=f"Entity '{name}' not found for user '{user_id}'.")
+
+
+@app.delete("/api/knowledge-graph/relationships", status_code=204)
+async def delete_knowledge_graph_relationship(body: dict, _user=Depends(_auth_dep)) -> None:
+    """Delete a specific relationship triple. Body: {from, relation, to, user_id?}."""
+    from jarvis.memory.graph import delete_relationship
+    frm = body.get("from", "")
+    relation = body.get("relation", "")
+    to = body.get("to", "")
+    if not frm or not relation or not to:
+        raise HTTPException(status_code=422, detail="'from', 'relation', and 'to' are required")
+    user_id = body.get("user_id", "shared")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    if not delete_relationship(db_path, frm, relation, to, user_id=user_id):
+        raise HTTPException(status_code=404, detail="Relationship not found.")
 
 
 # ── Metrics summary endpoint ───────────────────────────────────────────────────
 
 @app.get("/api/metrics/summary")
-async def get_metrics_summary() -> dict:
+async def get_metrics_summary(_user=Depends(_auth_dep)) -> dict:
     """Return a JSON summary of key Prometheus counters."""
     from prometheus_client import REGISTRY
 
@@ -1117,33 +1625,91 @@ async def get_metrics_summary() -> dict:
     return summary
 
 
+# ── Memory consolidation trigger ─────────────────────────────────────────────
+
+@app.post("/api/memory/consolidate/{user_id}", status_code=202)
+async def trigger_memory_consolidation(
+    user_id: str,
+    lookback_hours: int = 24,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Trigger memory consolidation for a user in the background.
+
+    Reads recent episodes, extracts preferences via LLM, and upserts them.
+    Returns immediately with status 202; consolidation runs asynchronously.
+    """
+    settings = get_settings()
+    db_path = settings.reports_dir / "jarvis.db"
+    model = settings.model
+
+    def _run() -> None:
+        try:
+            from jarvis.memory.consolidator import consolidate_user_memory
+            count = consolidate_user_memory(db_path, user_id, model, lookback_hours=lookback_hours)
+            log.info("consolidation_complete", user_id=user_id, preferences_written=count)
+        except Exception as exc:
+            log.error("consolidation_failed", user_id=user_id, error=str(exc))
+
+    asyncio.get_running_loop().run_in_executor(_executor, _run)
+    return {"status": "started", "user_id": user_id, "lookback_hours": lookback_hours}
+
+
 # ── Autonomous events endpoint ─────────────────────────────────────────────────
 
 @app.get("/api/autonomous/events")
-async def get_autonomous_events(limit: int = 20) -> list[dict]:
+async def get_autonomous_events(limit: int = 20, _user=Depends(_auth_dep)) -> list[dict]:
     """Return recent autonomous agent events from the database."""
     db_path = get_settings().reports_dir / "jarvis.db"
     try:
         import sqlite3
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS autonomous_events "
-            "(id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, summary TEXT, timestamp REAL)"
-        )
-        rows = conn.execute(
-            "SELECT * FROM autonomous_events ORDER BY timestamp DESC LIMIT ?", (limit,)
-        ).fetchall()
-        conn.close()
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS autonomous_events "
+                "(id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT, summary TEXT, timestamp REAL)"
+            )
+            rows = conn.execute(
+                "SELECT * FROM autonomous_events ORDER BY timestamp DESC LIMIT ?", (limit,)
+            ).fetchall()
+        finally:
+            conn.close()
         return [dict(r) for r in rows]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.post("/api/autonomous/events", status_code=202)
+async def inject_autonomous_event(
+    body: dict,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Inject an ExternalEvent into the live event bus to trigger the autonomous agent.
+
+    Body: {"sub_type": str, "payload": dict}  (payload is optional)
+    Returns 503 when the proactive event bus is not running.
+    """
+    settings = get_settings()
+    if not settings.proactive_enabled:
+        raise HTTPException(status_code=503, detail="Proactive event bus is not enabled.")
+
+    sub_type = body.get("sub_type", "").strip()
+    if not sub_type:
+        raise HTTPException(status_code=422, detail="sub_type is required.")
+
+    from jarvis.events.bus import get_event_bus
+    from jarvis.events.types import ExternalEvent
+    event = ExternalEvent(sub_type=sub_type, payload=body.get("payload") or {})
+    bus = get_event_bus()
+    await bus.publish(event)
+    log.info("autonomous_event_injected", sub_type=sub_type)
+    return {"status": "published", "sub_type": sub_type}
+
+
 # ── Training pipeline API ──────────────────────────────────────────────────────
 
 @app.get("/api/training/status")
-async def get_training_status() -> dict:
+async def get_training_status(_user=Depends(_auth_dep)) -> dict:
     """Return current auto-training config and last run info."""
     settings = get_settings()
     db_path = settings.reports_dir / "jarvis.db"
@@ -1189,7 +1755,7 @@ async def get_training_status() -> dict:
 
 
 @app.get("/api/training/history")
-async def get_training_history(limit: int = 20) -> list[dict]:
+async def get_training_history(limit: int = 20, _user=Depends(_auth_dep)) -> list[dict]:
     """Return recent training run records."""
     db_path = get_settings().reports_dir / "jarvis.db"
     try:
@@ -1208,8 +1774,35 @@ async def get_training_history(limit: int = 20) -> list[dict]:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/api/training/runs/{run_id}")
+async def get_training_run(run_id: int, _user=Depends(_auth_dep)) -> dict:
+    """Return a specific training run record by ID."""
+    from jarvis.training.tracking import get_run_by_id
+    db_path = get_settings().reports_dir / "jarvis.db"
+    if not db_path.exists():
+        raise HTTPException(status_code=404, detail=f"Training run {run_id} not found.")
+    run = get_run_by_id(db_path, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Training run {run_id} not found.")
+    return {
+        "id": run.id, "run_type": run.run_type, "status": run.status,
+        "started_at": run.started_at, "completed_at": run.completed_at,
+        "docs_crawled": run.docs_crawled, "pairs_generated": run.pairs_generated,
+        "model_name": run.model_name, "notes": run.notes,
+    }
+
+
+@app.delete("/api/training/runs/{run_id}", status_code=204)
+async def delete_training_run(run_id: int, _user=Depends(_auth_dep)) -> None:
+    """Delete a training run record by ID."""
+    from jarvis.training.tracking import delete_run
+    db_path = get_settings().reports_dir / "jarvis.db"
+    if not db_path.exists() or not delete_run(db_path, run_id):
+        raise HTTPException(status_code=404, detail=f"Training run {run_id} not found.")
+
+
 @app.post("/api/training/crawl")
-async def trigger_crawl(background_tasks) -> dict:
+async def trigger_crawl(_user=Depends(_auth_dep)) -> dict:
     """Trigger an immediate research crawl in the background."""
     settings = get_settings()
     db_path = settings.reports_dir / "jarvis.db"
@@ -1219,28 +1812,270 @@ async def trigger_crawl(background_tasks) -> dict:
         from jarvis.scheduler.core import _auto_crawl_job
         _auto_crawl_job(str(db_path), str(reports_dir))
 
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(_executor, _run)
+    asyncio.get_running_loop().run_in_executor(_executor, _run)
     return {"status": "crawl started", "topics": settings.auto_training_topics}
 
 
 @app.post("/api/training/finetune")
-async def trigger_finetune() -> dict:
+async def trigger_finetune(_user=Depends(_auth_dep)) -> dict:
     """Trigger an immediate fine-tuning run in the background."""
     settings = get_settings()
     db_path = settings.reports_dir / "jarvis.db"
     reports_dir = settings.reports_dir
 
-    if not settings.anthropic_api_key:
-        raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY not configured")
-
     def _run():
         from jarvis.scheduler.core import _auto_finetune_job
         _auto_finetune_job(str(db_path), str(reports_dir))
 
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(_executor, _run)
+    asyncio.get_running_loop().run_in_executor(_executor, _run)
     return {"status": "finetune started", "model_name": settings.auto_training_model_name}
+
+
+# ── Evals ─────────────────────────────────────────────────────────────────────
+
+@app.post("/api/evals", response_model=EvalRunResponse)
+async def run_evals(
+    body: EvalRunRequest,
+    _user=Depends(_auth_dep),
+) -> EvalRunResponse:
+    """Run the eval suite and return aggregated results. Runs in background thread."""
+    import uuid as _uuid
+    settings = get_settings()
+
+    def _run() -> EvalRunResponse:
+        from jarvis.evals.suite import BASELINE_SUITE
+        from jarvis.evals.runner import run_suite, summarize, persist_results
+
+        results = run_suite(
+            cases=BASELINE_SUITE,
+            settings=settings,
+            use_judge=body.use_judge,
+            tags_filter=body.tags or None,
+        )
+        summary = summarize(results)
+        persist_results(results, summary, settings.reports_dir)
+
+        run_id = str(_uuid.uuid4())[:8]
+        return EvalRunResponse(
+            run_id=run_id,
+            total=summary["total"],
+            passed=summary["passed"],
+            failed=summary["failed"],
+            pass_rate=summary["pass_rate"],
+            avg_latency_s=summary["avg_latency_s"],
+            total_cost_usd=summary["total_cost_usd"],
+            avg_judge_score=summary.get("avg_judge_score"),
+            results=[
+                EvalResultItem(
+                    case_id=r.case_id,
+                    overall_pass=r.overall_pass,
+                    contains_pass=r.contains_pass,
+                    forbidden_pass=r.forbidden_pass,
+                    latency_s=r.latency_s,
+                    cost_usd=r.cost_usd,
+                    judge_score=r.judge_score,
+                    error=r.error,
+                )
+                for r in results
+            ],
+        )
+
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(_executor, _run)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/evals/results")
+async def get_eval_results(
+    limit: int = 10,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return recent eval run summaries from eval_history.jsonl."""
+    import json as _json
+    settings = get_settings()
+    history_path = settings.reports_dir / "eval_history.jsonl"
+    if not history_path.exists():
+        return []
+    try:
+        lines = history_path.read_text(encoding="utf-8").splitlines()
+        records = [_json.loads(line) for line in lines if line.strip()]
+        return [{"timestamp": r["timestamp"], "git_hash": r.get("git_hash", ""), **r["summary"]}
+                for r in records[-limit:]]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Eval case CRUD ─────────────────────────────────────────────────────────────
+
+def _eval_cases_path() -> "Path":
+    from pathlib import Path as _Path
+    return get_settings().reports_dir / "eval_cases.json"
+
+
+def _load_eval_cases() -> list:
+    import dataclasses
+    from jarvis.evals.suite import BASELINE_SUITE, load_suite
+    path = _eval_cases_path()
+    if path.exists():
+        try:
+            return [dataclasses.asdict(c) for c in load_suite(path)]
+        except Exception:
+            pass
+    return [dataclasses.asdict(c) for c in BASELINE_SUITE]
+
+
+def _save_eval_cases(cases_dicts: list) -> None:
+    import dataclasses
+    from jarvis.evals.suite import EvalCase, save_suite
+    cases = [EvalCase(**d) for d in cases_dicts]
+    path = _eval_cases_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_suite(cases, path)
+
+
+@app.get("/api/evals/cases")
+async def list_eval_cases(_user=Depends(_auth_dep)) -> list[dict]:
+    """Return all eval cases (custom + baseline)."""
+    return _load_eval_cases()
+
+
+@app.post("/api/evals/cases", status_code=201)
+async def create_eval_case(body: dict, _user=Depends(_auth_dep)) -> dict:
+    """Add a new eval case. Requires 'id' and 'prompt' fields."""
+    case_id = str(body.get("id", "")).strip()
+    prompt = str(body.get("prompt", "")).strip()
+    if not case_id:
+        raise HTTPException(status_code=422, detail="'id' is required")
+    if not prompt:
+        raise HTTPException(status_code=422, detail="'prompt' is required")
+
+    cases = _load_eval_cases()
+    if any(c["id"] == case_id for c in cases):
+        raise HTTPException(status_code=409, detail=f"Eval case '{case_id}' already exists")
+
+    new_case = {
+        "id": case_id,
+        "prompt": prompt,
+        "expected_contains": body.get("expected_contains", []),
+        "forbidden": body.get("forbidden", []),
+        "judge_rubric": body.get("judge_rubric", ""),
+        "tags": body.get("tags", []),
+        "timeout_seconds": body.get("timeout_seconds", 120),
+    }
+    cases.append(new_case)
+    _save_eval_cases(cases)
+    log.info("eval_case_created", case_id=case_id)
+    return new_case
+
+
+@app.delete("/api/evals/cases/{case_id}", status_code=204)
+async def delete_eval_case(case_id: str, _user=Depends(_auth_dep)) -> None:
+    """Delete an eval case by ID."""
+    cases = _load_eval_cases()
+    remaining = [c for c in cases if c["id"] != case_id]
+    if len(remaining) == len(cases):
+        raise HTTPException(status_code=404, detail=f"Eval case '{case_id}' not found")
+    _save_eval_cases(remaining)
+    log.info("eval_case_deleted", case_id=case_id)
+
+
+# ── Parallel map SSE ─────────────────────────────────────────────────────────
+
+@app.post("/api/parallel-map/stream")
+async def parallel_map_stream(
+    body: ParallelMapRequest,
+    _user=Depends(_auth_dep),
+) -> StreamingResponse:
+    """Run parallel_map and stream one SSE event per topic as it completes.
+
+    Event format (text/event-stream):
+      data: {"type": "topic", "topic": "...", "result": "..."}
+      data: {"type": "synthesis", "result": "..."}   (only when synthesize=True)
+      data: {"type": "done"}
+    """
+    import json as _json
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    settings = get_settings()
+    base_schemas, base_registry = build_registry(settings)
+
+    from jarvis.agents.researcher import ResearcherAgent
+    from jarvis.agents.coder import CoderAgent
+    from jarvis.agents.qa import QAAgent
+    from jarvis.agents.data_analyst import DataAnalystAgent
+    from jarvis.agents.devops import DevOpsAgent
+
+    _agent_classes = {
+        "researcher": ResearcherAgent,
+        "coder": CoderAgent,
+        "qa": QAAgent,
+        "analyst": DataAnalystAgent,
+        "devops": DevOpsAgent,
+    }
+    AgentClass = _agent_classes.get(body.agent_type)
+    if AgentClass is None:
+        raise HTTPException(status_code=422, detail=f"Unknown agent_type '{body.agent_type}'")
+
+    def _run_topic(topic: str) -> tuple[str, str]:
+        task = body.task_template.replace("{topic}", topic)
+        try:
+            agent = AgentClass(
+                model=settings.model,
+                max_tokens=settings.max_tokens,
+                tool_schemas=base_schemas,
+                tool_registry=base_registry,
+            )
+            result, _ = agent.run_turn([{"role": "user", "content": task}])
+            return topic, result
+        except Exception as exc:
+            return topic, f"ERROR: {exc}"
+
+    async def _event_generator():
+        loop = asyncio.get_running_loop()
+        n_workers = min(len(body.topics), 8)
+        topic_results: dict[str, str] = {}
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            future_to_topic = {loop.run_in_executor(pool, _run_topic, t): t for t in body.topics}
+            pending = set(future_to_topic)
+
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for fut in done:
+                    topic, result = await fut
+                    topic_results[topic] = result
+                    payload = _json.dumps({"type": "topic", "topic": topic, "result": result})
+                    yield f"data: {payload}\n\n"
+
+        if body.synthesize and len(body.topics) > 1:
+            combined = "\n\n".join(
+                f"[{t}]:\n{topic_results.get(t, '')[:1500]}" for t in body.topics
+            )
+            synthesis_prompt = (
+                f"Synthesise research findings on {len(body.topics)} topics. "
+                "Highlight common themes, key differences, and cross-cutting insights.\n\n"
+                + combined
+            )
+            try:
+                synth_agent = ResearcherAgent(
+                    model=settings.model,
+                    max_tokens=settings.max_tokens,
+                    tool_schemas=base_schemas,
+                    tool_registry=base_registry,
+                )
+                synthesis, _ = await loop.run_in_executor(
+                    _executor,
+                    lambda: synth_agent.run_turn([{"role": "user", "content": synthesis_prompt}]),
+                )
+                yield f"data: {_json.dumps({'type': 'synthesis', 'result': synthesis})}\n\n"
+            except Exception as exc:
+                yield f"data: {_json.dumps({'type': 'synthesis', 'result': f'ERROR: {exc}'})}\n\n"
+
+        yield f"data: {_json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(_event_generator(), media_type="text/event-stream")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

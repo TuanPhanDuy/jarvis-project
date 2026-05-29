@@ -28,10 +28,16 @@ class TestDelegateBatchSchema:
         item_schema = SCHEMA["input_schema"]["properties"]["tasks"]["items"]
         assert set(item_schema["required"]) == {"id", "agent_type", "task"}
 
-    def test_agent_type_enum_has_all_five(self):
+    def test_agent_type_enum_has_all_types(self):
         item_schema = SCHEMA["input_schema"]["properties"]["tasks"]["items"]
         enum = item_schema["properties"]["agent_type"]["enum"]
-        assert set(enum) == {"researcher", "coder", "qa", "analyst", "devops"}
+        assert {"researcher", "coder", "qa", "analyst", "devops", "consensus"}.issubset(set(enum))
+
+    def test_schema_supports_timeout_seconds(self):
+        assert "timeout_seconds" in SCHEMA["input_schema"]["properties"]
+
+    def test_schema_max_items_is_ten(self):
+        assert SCHEMA["input_schema"]["properties"]["tasks"]["maxItems"] == 10
 
 
 class TestDelegateBatchHandler:
@@ -168,6 +174,61 @@ class TestDelegateBatchHandler:
             })
 
         assert call_count["n"] == 4
+
+
+class TestDelegateBatchConsensus:
+    def test_consensus_agent_type_dispatches_consensus_agent(self, mock_ollama):
+        from jarvis.agents.consensus import ConsensusAgent
+
+        consensus_calls: list[str] = []
+
+        def fake_consensus_run(self_inner, prompt):
+            consensus_calls.append(prompt)
+            return "consensus result"
+
+        with patch.object(ConsensusAgent, "run", fake_consensus_run):
+            handler = _make_handler()
+            result = handler({
+                "tasks": [
+                    {"id": "c1", "agent_type": "consensus", "task": "What is RLHF?"},
+                    {"id": "r1", "agent_type": "researcher", "task": "Describe transformers"},
+                ]
+            })
+
+        assert len(consensus_calls) == 1
+        assert "consensus result" in result
+
+    def test_unknown_agent_type_includes_consensus_in_valid_list(self, mock_ollama):
+        handler = _make_handler()
+        result = handler({
+            "tasks": [
+                {"id": "bad", "agent_type": "wizard", "task": "do magic"},
+                {"id": "ok",  "agent_type": "researcher", "task": "research AI"},
+            ]
+        })
+        assert "ERROR" in result
+        assert "consensus" in result
+
+
+class TestDelegateBatchTimeout:
+    def test_timeout_populates_error_for_unfinished_tasks(self, mock_ollama):
+        import time
+
+        def slow_run_turn(self_inner, messages, on_chunk=None):
+            time.sleep(5)
+            return "slow result", messages
+
+        with patch("jarvis.agents.researcher.ResearcherAgent.run_turn", slow_run_turn):
+            handler = _make_handler()
+            result = handler({
+                "tasks": [
+                    {"id": "slow", "agent_type": "researcher", "task": "slow task"},
+                    {"id": "slow2", "agent_type": "researcher", "task": "slow task 2"},
+                ],
+                "timeout_seconds": 0.05,
+            })
+
+        assert "ERROR" in result
 
 
 class TestRegistryIntegration:

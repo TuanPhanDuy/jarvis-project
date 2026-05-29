@@ -51,50 +51,56 @@ def _current_period() -> str:
 def set_budget(db_path: Path, user_id: str, monthly_budget_usd: float) -> None:
     """Set or update the monthly USD budget for a user."""
     conn = _get_conn(db_path)
-    conn.execute(
-        """
-        INSERT INTO usage_budgets (user_id, monthly_budget_usd, spent_usd, period)
-        VALUES (?, ?, 0, ?)
-        ON CONFLICT(user_id) DO UPDATE SET monthly_budget_usd = excluded.monthly_budget_usd
-        """,
-        (user_id, monthly_budget_usd, _current_period()),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            """
+            INSERT INTO usage_budgets (user_id, monthly_budget_usd, spent_usd, period)
+            VALUES (?, ?, 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET monthly_budget_usd = excluded.monthly_budget_usd
+            """,
+            (user_id, monthly_budget_usd, _current_period()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def record_spend(db_path: Path, user_id: str, cost_usd: float) -> None:
     """Accumulate spending for a user. Resets counter if a new month started."""
     conn = _get_conn(db_path)
-    period = _current_period()
-    row = conn.execute(
-        "SELECT monthly_budget_usd, spent_usd, period FROM usage_budgets WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
+    try:
+        period = _current_period()
+        row = conn.execute(
+            "SELECT monthly_budget_usd, spent_usd, period FROM usage_budgets WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
 
-    if row is None:
-        conn.execute(
-            "INSERT INTO usage_budgets (user_id, monthly_budget_usd, spent_usd, period) VALUES (?,0,?,?)",
-            (user_id, cost_usd, period),
-        )
-    else:
-        spent = 0.0 if row["period"] != period else row["spent_usd"]
-        conn.execute(
-            "UPDATE usage_budgets SET spent_usd = ?, period = ? WHERE user_id = ?",
-            (spent + cost_usd, period, user_id),
-        )
-    conn.commit()
-    conn.close()
+        if row is None:
+            conn.execute(
+                "INSERT INTO usage_budgets (user_id, monthly_budget_usd, spent_usd, period) VALUES (?,0,?,?)",
+                (user_id, cost_usd, period),
+            )
+        else:
+            spent = 0.0 if row["period"] != period else row["spent_usd"]
+            conn.execute(
+                "UPDATE usage_budgets SET spent_usd = ?, period = ? WHERE user_id = ?",
+                (spent + cost_usd, period, user_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def check_budget(db_path: Path, user_id: str) -> None:
     """Raise BudgetExceededError if user is over their monthly limit (0 = unlimited)."""
     conn = _get_conn(db_path)
-    row = conn.execute(
-        "SELECT monthly_budget_usd, spent_usd, period FROM usage_budgets WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
-    conn.close()
+    try:
+        row = conn.execute(
+            "SELECT monthly_budget_usd, spent_usd, period FROM usage_budgets WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    finally:
+        conn.close()
 
     if row is None or row["monthly_budget_usd"] == 0:
         return  # no budget set = unlimited
@@ -104,13 +110,41 @@ def check_budget(db_path: Path, user_id: str) -> None:
         raise BudgetExceededError(user_id, row["monthly_budget_usd"], row["spent_usd"])
 
 
+def get_all_budget_statuses(db_path: Path) -> list[dict]:
+    """Return budget status for every user in the database."""
+    conn = _get_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT user_id, monthly_budget_usd, spent_usd, period FROM usage_budgets ORDER BY user_id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    period = _current_period()
+    result = []
+    for row in rows:
+        spent = row["spent_usd"] if row["period"] == period else 0.0
+        budget = row["monthly_budget_usd"]
+        remaining = None if budget == 0 else max(0.0, budget - spent)
+        result.append({
+            "user_id": row["user_id"],
+            "monthly_budget_usd": budget,
+            "spent_usd": round(spent, 6),
+            "remaining_usd": round(remaining, 6) if remaining is not None else None,
+            "period": period,
+        })
+    return result
+
+
 def get_budget_status(db_path: Path, user_id: str) -> dict:
     conn = _get_conn(db_path)
-    row = conn.execute(
-        "SELECT monthly_budget_usd, spent_usd, period FROM usage_budgets WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
-    conn.close()
+    try:
+        row = conn.execute(
+            "SELECT monthly_budget_usd, spent_usd, period FROM usage_budgets WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    finally:
+        conn.close()
     if row is None:
         return {"user_id": user_id, "monthly_budget_usd": 0, "spent_usd": 0.0,
                 "remaining_usd": None, "period": _current_period()}

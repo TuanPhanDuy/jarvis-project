@@ -5,6 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from jarvis.agents.executor import ExecutorAgent, PlanStep
+from jarvis.config import get_settings
 
 
 def build_plan_handler(
@@ -42,6 +43,7 @@ def build_plan_handler(
                     description=s.get("description", ""),
                     agent_type=s.get("agent_type", "researcher"),
                     depends_on=s.get("depends_on", []),
+                    n_agents=int(s.get("n_agents", get_settings().consensus_n_agents)),
                 )
                 for i, s in enumerate(raw_steps)
             ]
@@ -75,7 +77,8 @@ SCHEMA: dict = {
                     "properties": {
                         "id": {"type": "string", "description": "Unique step id (e.g. 'research', 'code', 'review')."},
                         "description": {"type": "string", "description": "Self-contained task for this step."},
-                        "agent_type": {"type": "string", "enum": ["researcher", "coder", "qa", "analyst", "devops"]},
+                        "agent_type": {"type": "string", "enum": ["researcher", "coder", "qa", "analyst", "devops", "consensus"]},
+                        "n_agents": {"type": "integer", "description": "For 'consensus' only: number of parallel researchers (default 3).", "default": 3},
                         "depends_on": {"type": "array", "items": {"type": "string"}, "default": []},
                     },
                     "required": ["id", "description", "agent_type"],

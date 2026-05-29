@@ -92,7 +92,7 @@ async def handle_event(
         except Exception as exc:
             result_holder.append(f"[JARVIS autonomous response failed: {exc}]")
 
-    await asyncio.get_event_loop().run_in_executor(_executor, run)
+    await asyncio.get_running_loop().run_in_executor(_executor, run)
 
     if not result_holder:
         return

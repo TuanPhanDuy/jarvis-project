@@ -50,8 +50,9 @@ class Finetuner:
             "--iters", str(iters),
         ]
         log.info("finetune_start", model=self._base_model, epochs=epochs, iters=iters)
-        result = subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if result.returncode != 0:
+            log.error("finetune_failed", returncode=result.returncode, stderr=result.stderr[-2000:])
             raise RuntimeError(f"mlx_lm.lora exited with code {result.returncode}")
         log.info("finetune_complete", adapter_dir=str(self._adapter_dir))
 
@@ -66,7 +67,8 @@ class Finetuner:
             "--export-gguf",
         ]
         log.info("gguf_export_start", output=str(output_path))
-        result = subprocess.run(cmd, check=False)
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if result.returncode != 0:
+            log.error("gguf_export_failed", returncode=result.returncode, stderr=result.stderr[-2000:])
             raise RuntimeError(f"mlx_lm.fuse exited with code {result.returncode}")
         log.info("gguf_export_complete", path=str(output_path))

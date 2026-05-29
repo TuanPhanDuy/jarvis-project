@@ -93,6 +93,43 @@ def get_user(db_path: Path, username: str) -> User | None:
         conn.close()
 
 
+def list_users(db_path: Path) -> list[dict]:
+    """Return all users as plain dicts (without password/salt)."""
+    conn = _get_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id, username, role, created_at FROM users ORDER BY created_at DESC"
+        ).fetchall()
+        return [{"user_id": r["id"], "username": r["username"], "role": r["role"],
+                 "created_at": r["created_at"]} for r in rows]
+    finally:
+        conn.close()
+
+
+def delete_user(db_path: Path, username: str) -> bool:
+    """Delete a user by username. Returns True if a row was deleted."""
+    conn = _get_conn(db_path)
+    try:
+        cur = conn.execute("DELETE FROM users WHERE username = ?", (username,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
+def update_user_role(db_path: Path, username: str, role: str) -> bool:
+    """Update a user's role. Returns True if a row was updated."""
+    conn = _get_conn(db_path)
+    try:
+        cur = conn.execute("UPDATE users SET role = ? WHERE username = ?", (role, username))
+        updated = cur.rowcount > 0
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
 # ── JWT ───────────────────────────────────────────────────────────────────────
 
 def create_token(user: User, secret: str, expire_minutes: int = 1440) -> str:

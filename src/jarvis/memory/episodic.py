@@ -54,12 +54,14 @@ def log_episode(
     """Append a conversation turn to episodic memory. Best-effort — never raises."""
     try:
         conn = _get_conn(db_path)
-        conn.execute(
-            "INSERT INTO episodes (timestamp, session_id, user_id, role, content) VALUES (?,?,?,?,?)",
-            (time.time(), session_id, user_id, role, content),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "INSERT INTO episodes (timestamp, session_id, user_id, role, content) VALUES (?,?,?,?,?)",
+                (time.time(), session_id, user_id, role, content),
+            )
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         pass
 
@@ -69,28 +71,29 @@ def _search(db_path: Path, query: str, limit: int, user_id: str | None = None) -
     user_filter = "AND e.user_id = ?" if user_id else ""
     user_arg = (user_id,) if user_id else ()
     try:
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT e.id, e.timestamp, e.session_id, e.user_id, e.role, e.content
+                FROM episodes_fts f
+                JOIN episodes e ON e.id = f.rowid
+                WHERE episodes_fts MATCH ? {user_filter}
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (query, *user_arg, limit),
+            ).fetchall()
+            if rows:
+                return rows
+        except sqlite3.OperationalError:
+            pass
         rows = conn.execute(
-            f"""
-            SELECT e.id, e.timestamp, e.session_id, e.user_id, e.role, e.content
-            FROM episodes_fts f
-            JOIN episodes e ON e.id = f.rowid
-            WHERE episodes_fts MATCH ? {user_filter}
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (query, *user_arg, limit),
+            f"SELECT * FROM episodes WHERE content LIKE ? {user_filter} ORDER BY timestamp DESC LIMIT ?",
+            (f"%{query}%", *user_arg, limit),
         ).fetchall()
-        if rows:
-            conn.close()
-            return rows
-    except sqlite3.OperationalError:
-        pass
-    rows = conn.execute(
-        f"SELECT * FROM episodes WHERE content LIKE ? {user_filter} ORDER BY timestamp DESC LIMIT ?",
-        (f"%{query}%", *user_arg, limit),
-    ).fetchall()
-    conn.close()
-    return rows
+        return rows
+    finally:
+        conn.close()
 
 
 def handle_search_episodic_memory(tool_input: dict, db_path: Path, user_id: str | None = None) -> str:
@@ -111,6 +114,53 @@ def handle_search_episodic_memory(tool_input: dict, db_path: Path, user_id: str 
         return "\n".join(lines)
     except Exception as e:
         return f"ERROR: search_episodic_memory failed — {e}"
+
+
+def search_episodes(
+    db_path: Path,
+    query: str,
+    limit: int = 20,
+    user_id: str | None = None,
+) -> list[dict]:
+    """Full-text search episodes. Returns plain dicts, newest-first."""
+    try:
+        rows = _search(db_path, query, limit, user_id=user_id)
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def delete_episodes(
+    db_path: Path,
+    session_id: str | None = None,
+    user_id: str | None = None,
+) -> int:
+    """Delete episodes filtered by session_id and/or user_id.
+
+    At least one filter must be provided. Returns number of rows deleted.
+    """
+    if not session_id and not user_id:
+        raise ValueError("Provide at least one of session_id or user_id")
+    try:
+        conn = _get_conn(db_path)
+        try:
+            where_parts, params = [], []
+            if session_id:
+                where_parts.append("session_id = ?")
+                params.append(session_id)
+            if user_id:
+                where_parts.append("user_id = ?")
+                params.append(user_id)
+            cur = conn.execute(
+                f"DELETE FROM episodes WHERE {' AND '.join(where_parts)}", params
+            )
+            deleted = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+        return deleted
+    except Exception:
+        return 0
 
 
 def prune_old_episodes(db_path: Path, retention_days: int) -> int:

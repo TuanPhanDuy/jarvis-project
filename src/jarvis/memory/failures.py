@@ -35,12 +35,14 @@ def log_failure(db_path: Path, tool_name: str, tool_input: dict, error_msg: str)
     """Log a tool failure. Best-effort — never raises."""
     try:
         conn = _get_conn(db_path)
-        conn.execute(
-            "INSERT INTO tool_failures (timestamp, tool_name, tool_input, error_msg) VALUES (?, ?, ?, ?)",
-            (time.time(), tool_name, json.dumps(tool_input, default=str), error_msg),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "INSERT INTO tool_failures (timestamp, tool_name, tool_input, error_msg) VALUES (?, ?, ?, ?)",
+                (time.time(), tool_name, json.dumps(tool_input, default=str), error_msg),
+            )
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         pass
 
@@ -50,27 +52,28 @@ def handle_analyze_failures(tool_input: dict, db_path: Path) -> str:
     try:
         tool_name = tool_input.get("tool_name")
         conn = _get_conn(db_path)
-
-        if tool_name:
-            rows = conn.execute(
-                """
-                SELECT tool_name, error_msg, COUNT(*) AS count
-                FROM tool_failures WHERE tool_name = ?
-                GROUP BY tool_name, error_msg
-                ORDER BY count DESC LIMIT 20
-                """,
-                (tool_name,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT tool_name, error_msg, COUNT(*) AS count
-                FROM tool_failures
-                GROUP BY tool_name, error_msg
-                ORDER BY count DESC LIMIT 20
-                """
-            ).fetchall()
-        conn.close()
+        try:
+            if tool_name:
+                rows = conn.execute(
+                    """
+                    SELECT tool_name, error_msg, COUNT(*) AS count
+                    FROM tool_failures WHERE tool_name = ?
+                    GROUP BY tool_name, error_msg
+                    ORDER BY count DESC LIMIT 20
+                    """,
+                    (tool_name,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT tool_name, error_msg, COUNT(*) AS count
+                    FROM tool_failures
+                    GROUP BY tool_name, error_msg
+                    ORDER BY count DESC LIMIT 20
+                    """
+                ).fetchall()
+        finally:
+            conn.close()
 
         if not rows:
             subject = f"'{tool_name}'" if tool_name else "any tool"
@@ -84,15 +87,55 @@ def handle_analyze_failures(tool_input: dict, db_path: Path) -> str:
         return f"ERROR: analyze_failures failed — {e}"
 
 
+def get_failure_patterns(
+    db_path: Path,
+    tool_name: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Return failure patterns as a list of {tool_name, error_msg, count} dicts, sorted by count desc."""
+    try:
+        if not db_path.exists():
+            return []
+        conn = _get_conn(db_path)
+        try:
+            if tool_name:
+                rows = conn.execute(
+                    """
+                    SELECT tool_name, error_msg, COUNT(*) AS count
+                    FROM tool_failures WHERE tool_name = ?
+                    GROUP BY tool_name, error_msg
+                    ORDER BY count DESC LIMIT ?
+                    """,
+                    (tool_name, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT tool_name, error_msg, COUNT(*) AS count
+                    FROM tool_failures
+                    GROUP BY tool_name, error_msg
+                    ORDER BY count DESC LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        finally:
+            conn.close()
+        return [{"tool_name": r["tool_name"], "error_msg": r["error_msg"], "count": r["count"]} for r in rows]
+    except Exception:
+        return []
+
+
 def prune_old_failures(db_path: Path, retention_days: int) -> int:
     """Delete failure records older than retention_days. Returns number of rows deleted."""
     cutoff = time.time() - retention_days * 86400
     try:
         conn = _get_conn(db_path)
-        cur = conn.execute("DELETE FROM tool_failures WHERE timestamp < ?", (cutoff,))
-        deleted = cur.rowcount
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.execute("DELETE FROM tool_failures WHERE timestamp < ?", (cutoff,))
+            deleted = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
         return deleted
     except Exception:
         return 0

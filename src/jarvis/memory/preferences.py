@@ -67,20 +67,22 @@ def upsert_preference(
     """Insert or update a user preference. Best-effort — never raises."""
     try:
         conn = _get_conn(db_path)
-        conn.execute(
-            """
-            INSERT INTO user_preferences (user_id, category, key, value, confidence, source, updated_at)
-            VALUES (?,?,?,?,?,?,?)
-            ON CONFLICT(user_id, category, key) DO UPDATE SET
-                value      = excluded.value,
-                confidence = MAX(user_preferences.confidence, excluded.confidence),
-                source     = excluded.source,
-                updated_at = excluded.updated_at
-            """,
-            (user_id, category, key, value, confidence, source, time.time()),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """
+                INSERT INTO user_preferences (user_id, category, key, value, confidence, source, updated_at)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(user_id, category, key) DO UPDATE SET
+                    value      = excluded.value,
+                    confidence = MAX(user_preferences.confidence, excluded.confidence),
+                    source     = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, category, key, value, confidence, source, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         pass
 
@@ -89,11 +91,13 @@ def get_preferences(db_path: Path, user_id: str) -> dict[str, dict[str, str]]:
     """Return all preferences for a user as {category: {key: value}}."""
     try:
         conn = _get_conn(db_path)
-        rows = conn.execute(
-            "SELECT category, key, value, confidence FROM user_preferences WHERE user_id = ? ORDER BY confidence DESC",
-            (user_id,),
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT category, key, value, confidence FROM user_preferences WHERE user_id = ? ORDER BY confidence DESC",
+                (user_id,),
+            ).fetchall()
+        finally:
+            conn.close()
         result: dict[str, dict[str, str]] = {}
         for row in rows:
             result.setdefault(row["category"], {})[row["key"]] = row["value"]
@@ -106,15 +110,35 @@ def get_preferences_with_metadata(db_path: Path, user_id: str) -> list[dict]:
     """Return all preferences with full metadata including updated_at and confidence."""
     try:
         conn = _get_conn(db_path)
-        rows = conn.execute(
-            "SELECT category, key, value, confidence, updated_at, source "
-            "FROM user_preferences WHERE user_id = ?",
-            (user_id,),
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT category, key, value, confidence, updated_at, source "
+                "FROM user_preferences WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+        finally:
+            conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+def delete_preference(db_path: Path, user_id: str, category: str, key: str) -> bool:
+    """Delete a single preference entry. Returns True if a row was deleted."""
+    try:
+        conn = _get_conn(db_path)
+        try:
+            cur = conn.execute(
+                "DELETE FROM user_preferences WHERE user_id = ? AND category = ? AND key = ?",
+                (user_id, category, key),
+            )
+            deleted = cur.rowcount > 0
+            conn.commit()
+        finally:
+            conn.close()
+        return deleted
+    except Exception:
+        return False
 
 
 _CATEGORY_LABELS = {
@@ -178,15 +202,17 @@ def save_session_summary(
     import json
     try:
         conn = _get_conn(db_path)
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO session_summaries (session_id, user_id, summary, key_topics, created_at)
-            VALUES (?,?,?,?,?)
-            """,
-            (session_id, user_id, summary, json.dumps(key_topics), time.time()),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO session_summaries (session_id, user_id, summary, key_topics, created_at)
+                VALUES (?,?,?,?,?)
+                """,
+                (session_id, user_id, summary, json.dumps(key_topics), time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         pass
 
@@ -195,12 +221,40 @@ def get_recent_session_summaries(db_path: Path, user_id: str, limit: int = 3) ->
     """Return the most recent session summary strings for a user, newest first."""
     try:
         conn = _get_conn(db_path)
-        rows = conn.execute(
-            "SELECT summary FROM session_summaries WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT summary FROM session_summaries WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        finally:
+            conn.close()
         return [r["summary"] for r in rows]
+    except Exception:
+        return []
+
+
+def get_session_summaries_full(db_path: Path, user_id: str, limit: int = 20) -> list[dict]:
+    """Return full session summary records for a user: {session_id, summary, key_topics, created_at}."""
+    import json
+    try:
+        conn = _get_conn(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT session_id, user_id, summary, key_topics, created_at "
+                "FROM session_summaries WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        finally:
+            conn.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["key_topics"] = json.loads(d.get("key_topics", "[]"))
+            except Exception:
+                d["key_topics"] = []
+            result.append(d)
+        return result
     except Exception:
         return []
 
@@ -210,12 +264,14 @@ def prune_old_preferences(db_path: Path, retention_days: int) -> int:
     cutoff = time.time() - retention_days * 86400
     try:
         conn = _get_conn(db_path)
-        cur = conn.execute("DELETE FROM user_preferences WHERE updated_at < ?", (cutoff,))
-        deleted = cur.rowcount
-        cur2 = conn.execute("DELETE FROM session_summaries WHERE created_at < ?", (cutoff,))
-        deleted += cur2.rowcount
-        conn.commit()
-        conn.close()
+        try:
+            cur = conn.execute("DELETE FROM user_preferences WHERE updated_at < ?", (cutoff,))
+            deleted = cur.rowcount
+            cur2 = conn.execute("DELETE FROM session_summaries WHERE created_at < ?", (cutoff,))
+            deleted += cur2.rowcount
+            conn.commit()
+        finally:
+            conn.close()
         return deleted
     except Exception:
         return 0

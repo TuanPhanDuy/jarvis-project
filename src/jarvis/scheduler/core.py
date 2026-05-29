@@ -64,9 +64,8 @@ def _monitor_job(query: str, session_id: str, rabbitmq_url: str, queue_name: str
 
 def _auto_crawl_job(db_path_str: str, reports_dir_str: str) -> None:
     """Scheduled job: crawl AI research from the internet and index into ChromaDB."""
+    run_id: int = -1
     try:
-        from pathlib import Path
-
         settings = get_settings()
         db_path = Path(db_path_str)
         reports_dir = Path(reports_dir_str)
@@ -94,7 +93,6 @@ def _auto_crawl_job(db_path_str: str, reports_dir_str: str) -> None:
     except Exception as exc:
         log.error("auto_crawl_failed", error=str(exc))
         try:
-            from pathlib import Path
             if run_id >= 0:
                 complete_run(Path(db_path_str), run_id, status="failed", notes=str(exc))
         except Exception:
@@ -105,17 +103,12 @@ def _auto_finetune_job(db_path_str: str, reports_dir_str: str) -> None:
     """Scheduled job: generate training data and fine-tune the model if enough new docs exist."""
     run_id: int = -1
     try:
-        from pathlib import Path
         from jarvis.training.data_generator import TrainingDataGenerator
         from jarvis.training.dataset_manager import DatasetManager
         from jarvis.training.finetune import Finetuner
         from jarvis.training.modelfile import register_model
 
         settings = get_settings()
-        if not settings.anthropic_api_key:
-            log.warning("auto_finetune_skipped", reason="ANTHROPIC_API_KEY not set")
-            return
-
         db_path = Path(db_path_str)
         reports_dir = Path(reports_dir_str)
         data_dir = Path(settings.training_data_dir)
@@ -131,7 +124,7 @@ def _auto_finetune_job(db_path_str: str, reports_dir_str: str) -> None:
 
         run_id = start_run(db_path, "finetune")
 
-        gen = TrainingDataGenerator(reports_dir, api_key=settings.anthropic_api_key)
+        gen = TrainingDataGenerator(reports_dir)
         dataset_path = data_dir / "dataset.jsonl"
         pairs = gen.run(dataset_path, target_pairs=settings.training_target_pairs)
 
@@ -160,7 +153,6 @@ def _auto_finetune_job(db_path_str: str, reports_dir_str: str) -> None:
     except Exception as exc:
         log.error("auto_finetune_failed", error=str(exc))
         try:
-            from pathlib import Path
             if run_id >= 0:
                 complete_run(Path(db_path_str), run_id, status="failed", notes=str(exc))
         except Exception:
@@ -178,10 +170,12 @@ def _graph_dedup_job(db_path_str: str) -> None:
         if not db_path.exists():
             return
         conn = sqlite3.connect(str(db_path))
-        user_ids = [row[0] for row in conn.execute(
-            "SELECT DISTINCT user_id FROM entities"
-        ).fetchall()]
-        conn.close()
+        try:
+            user_ids = [row[0] for row in conn.execute(
+                "SELECT DISTINCT user_id FROM entities"
+            ).fetchall()]
+        finally:
+            conn.close()
         total = 0
         for uid in user_ids:
             merged = deduplicate_entities(db_path, uid)
@@ -226,6 +220,67 @@ def _feedback_analyze_job(db_path_str: str, reports_dir_str: str) -> None:
         log.info("feedback_analyze_job_done", result=result)
     except Exception as exc:
         log.error("feedback_analyze_job_failed", error=str(exc))
+
+
+def _prune_memory_job(db_path_str: str) -> None:
+    """Scheduled job: delete old episodes, feedback, preferences, and failures."""
+    try:
+        settings = get_settings()
+        db_path = Path(db_path_str)
+        retention = settings.memory_retention_days
+
+        from jarvis.memory.episodic import prune_old_episodes
+        from jarvis.memory.feedback import prune_old_feedback
+        from jarvis.memory.failures import prune_old_failures
+        from jarvis.memory.preferences import prune_old_preferences
+        from jarvis.memory.turns import prune_old_turns
+        from jarvis.security.audit import prune_old_audit
+
+        ep_deleted = prune_old_episodes(db_path, retention)
+        fb_deleted = prune_old_feedback(db_path, retention)
+        fail_deleted = prune_old_failures(db_path, retention)
+        pref_deleted = prune_old_preferences(db_path, retention)
+        turns_deleted = prune_old_turns(db_path, retention)
+        audit_deleted = prune_old_audit(db_path, retention)
+        log.info(
+            "prune_memory_done",
+            episodes_deleted=ep_deleted,
+            feedback_deleted=fb_deleted,
+            failures_deleted=fail_deleted,
+            preferences_deleted=pref_deleted,
+            turns_deleted=turns_deleted,
+            audit_deleted=audit_deleted,
+            retention_days=retention,
+        )
+    except Exception as exc:
+        log.error("prune_memory_failed", error=str(exc))
+
+
+def _eval_check_job(db_path_str: str, reports_dir_str: str) -> None:
+    """Scheduled job: run eval suite; trigger fine-tuning if pass_rate < threshold."""
+    try:
+        settings = get_settings()
+        db_path = Path(db_path_str)
+        reports_dir = Path(reports_dir_str)
+
+        from jarvis.evals.suite import BASELINE_SUITE
+        from jarvis.evals.runner import run_suite, summarize, persist_results
+
+        results = run_suite(cases=BASELINE_SUITE, settings=settings, use_judge=False)
+        summary = summarize(results)
+        persist_results(results, summary, reports_dir)
+
+        pass_rate = summary.get("pass_rate", 1.0)
+        threshold = settings.eval_pass_rate_threshold
+        log.info("eval_check_done", pass_rate=pass_rate, threshold=threshold)
+
+        if pass_rate < threshold:
+            log.warning("eval_pass_rate_below_threshold",
+                        pass_rate=pass_rate, threshold=threshold,
+                        action="triggering_finetune")
+            _auto_finetune_job(db_path_str, reports_dir_str)
+    except Exception as exc:
+        log.error("eval_check_job_failed", error=str(exc))
 
 
 def _system_snapshot_job(db_path_str: str) -> None:
@@ -359,6 +414,12 @@ def _add_builtin_jobs(scheduler, db_path: Path, reports_dir: Path) -> None:
             CronTrigger(hour=1, minute=30, timezone="UTC"),
             [str(db_path)],
         ),
+        (
+            "builtin_prune_memory",
+            _prune_memory_job,
+            CronTrigger(hour=3, minute=30, timezone="UTC"),
+            [str(db_path)],
+        ),
     ]
     for job_id, func, trigger, args in _builtin:
         if not scheduler.get_job(job_id):
@@ -409,6 +470,18 @@ def _register_auto_training_jobs(scheduler, db_path: Path, reports_dir: Path) ->
                 misfire_grace_time=7200,
             )
             log.info("auto_finetune_job_registered", cron=settings.auto_finetune_cron)
+
+        if settings.auto_eval_enabled:
+            eval_trigger = _parse_cron(settings.eval_check_cron)
+            if not scheduler.get_job("builtin_eval_check"):
+                scheduler.add_job(
+                    _eval_check_job,
+                    eval_trigger,
+                    args=[str(db_path), str(reports_dir)],
+                    id="builtin_eval_check",
+                    misfire_grace_time=3600,
+                )
+                log.info("eval_check_job_registered", cron=settings.eval_check_cron)
     except Exception as exc:
         log.error("auto_training_job_registration_failed", error=str(exc))
 
@@ -456,4 +529,6 @@ JOB_FUNCTIONS = {
     "graph_dedup": _graph_dedup_job,
     "auto_crawl": _auto_crawl_job,
     "auto_finetune": _auto_finetune_job,
+    "eval_check": _eval_check_job,
+    "prune_memory": _prune_memory_job,
 }

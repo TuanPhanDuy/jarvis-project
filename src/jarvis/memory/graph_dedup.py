@@ -40,11 +40,13 @@ def find_duplicate_pairs(
         return []
     try:
         conn = sqlite3.connect(str(db_path))
-        rows = conn.execute(
-            "SELECT name FROM entities WHERE user_id = ? ORDER BY created_at ASC",
-            (user_id,),
-        ).fetchall()
-        conn.close()
+        try:
+            rows = conn.execute(
+                "SELECT name FROM entities WHERE user_id = ? ORDER BY created_at ASC",
+                (user_id,),
+            ).fetchall()
+        finally:
+            conn.close()
     except Exception:
         return []
 
@@ -77,26 +79,28 @@ def merge_entities(
     Returns the number of relationship rows updated.
     """
     if not db_path.exists():
-        return 0
+        return -1
     try:
         conn = sqlite3.connect(str(db_path))
-        updated = 0
-        for col in ("from_entity", "to_entity"):
-            cur = conn.execute(
-                f"UPDATE relationships SET {col} = ? "
-                f"WHERE {col} = ? AND user_id = ?",
-                (canonical, duplicate, user_id),
+        try:
+            updated = 0
+            for col in ("from_entity", "to_entity"):
+                cur = conn.execute(
+                    f"UPDATE relationships SET {col} = ? "
+                    f"WHERE {col} = ? AND user_id = ?",
+                    (canonical, duplicate, user_id),
+                )
+                updated += cur.rowcount
+            conn.execute(
+                "DELETE FROM entities WHERE name = ? AND user_id = ?",
+                (duplicate, user_id),
             )
-            updated += cur.rowcount
-        conn.execute(
-            "DELETE FROM entities WHERE name = ? AND user_id = ?",
-            (duplicate, user_id),
-        )
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
         return updated
     except Exception:
-        return 0
+        return -1
 
 
 def deduplicate_entities(

@@ -76,6 +76,58 @@ def get_breaker(tool_name: str) -> ToolCircuitBreaker:
         return _breakers[tool_name]
 
 
+def reset_breaker(tool_name: str) -> bool:
+    """Reset a single circuit breaker back to CLOSED. Returns False if it didn't exist."""
+    with _breakers_lock:
+        if tool_name not in _breakers:
+            return False
+        _breakers[tool_name] = ToolCircuitBreaker()
+        return True
+
+
+def get_all_states() -> list[dict]:
+    """Return a snapshot of every breaker's current state (thread-safe copy)."""
+    with _breakers_lock:
+        snapshot = list(_breakers.items())
+
+    result = []
+    for name, breaker in snapshot:
+        with breaker._lock:
+            result.append({
+                "tool": name,
+                "state": breaker._state.value,
+                "failure_count": breaker._failure_count,
+                "opened_at": breaker._opened_at if breaker._state is _State.OPEN else None,
+            })
+    return result
+
+
+def update_breaker_config(
+    tool_name: str,
+    failure_threshold: int | None = None,
+    reset_timeout_s: float | None = None,
+) -> dict:
+    """Update thresholds for a tool's breaker, creating it if absent.
+
+    Returns the updated config dict.
+    """
+    with _breakers_lock:
+        if tool_name not in _breakers:
+            _breakers[tool_name] = ToolCircuitBreaker()
+        breaker = _breakers[tool_name]
+
+    with breaker._lock:
+        if failure_threshold is not None:
+            breaker.failure_threshold = failure_threshold
+        if reset_timeout_s is not None:
+            breaker.reset_timeout_s = reset_timeout_s
+        return {
+            "tool": tool_name,
+            "failure_threshold": breaker.failure_threshold,
+            "reset_timeout_s": breaker.reset_timeout_s,
+        }
+
+
 def reset_all() -> None:
     """Reset all circuit breakers (useful in tests)."""
     with _breakers_lock:

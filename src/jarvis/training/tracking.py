@@ -49,13 +49,15 @@ def _conn(db_path: Path) -> sqlite3.Connection:
 def start_run(db_path: Path, run_type: str) -> int:
     """Insert a new running record; return its ID."""
     conn = _conn(db_path)
-    cur = conn.execute(
-        "INSERT INTO training_runs (run_type, status, started_at) VALUES (?, 'running', ?)",
-        (run_type, time.time()),
-    )
-    run_id = cur.lastrowid
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.execute(
+            "INSERT INTO training_runs (run_type, status, started_at) VALUES (?, 'running', ?)",
+            (run_type, time.time()),
+        )
+        run_id = cur.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
     return run_id
 
 
@@ -71,23 +73,27 @@ def complete_run(
 ) -> None:
     """Mark a run as completed (or failed)."""
     conn = _conn(db_path)
-    conn.execute(
-        """UPDATE training_runs
-           SET status=?, completed_at=?, docs_crawled=?, pairs_generated=?, model_name=?, notes=?
-           WHERE id=?""",
-        (status, time.time(), docs_crawled, pairs_generated, model_name, notes, run_id),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            """UPDATE training_runs
+               SET status=?, completed_at=?, docs_crawled=?, pairs_generated=?, model_name=?, notes=?
+               WHERE id=?""",
+            (status, time.time(), docs_crawled, pairs_generated, model_name, notes, run_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_history(db_path: Path, limit: int = 20) -> list[TrainingRun]:
     """Return the most recent training runs, newest first."""
     conn = _conn(db_path)
-    rows = conn.execute(
-        "SELECT * FROM training_runs ORDER BY started_at DESC LIMIT ?", (limit,)
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM training_runs ORDER BY started_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    finally:
+        conn.close()
     return [
         TrainingRun(
             id=r["id"],
@@ -107,18 +113,20 @@ def get_history(db_path: Path, limit: int = 20) -> list[TrainingRun]:
 def get_last_run(db_path: Path, run_type: str | None = None) -> TrainingRun | None:
     """Return the most recent completed run (optionally filtered by type)."""
     conn = _conn(db_path)
-    if run_type:
-        row = conn.execute(
-            "SELECT * FROM training_runs WHERE run_type=? AND status='completed' "
-            "ORDER BY completed_at DESC LIMIT 1",
-            (run_type,),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT * FROM training_runs WHERE status='completed' "
-            "ORDER BY completed_at DESC LIMIT 1"
-        ).fetchone()
-    conn.close()
+    try:
+        if run_type:
+            row = conn.execute(
+                "SELECT * FROM training_runs WHERE run_type=? AND status='completed' "
+                "ORDER BY completed_at DESC LIMIT 1",
+                (run_type,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM training_runs WHERE status='completed' "
+                "ORDER BY completed_at DESC LIMIT 1"
+            ).fetchone()
+    finally:
+        conn.close()
     if row is None:
         return None
     return TrainingRun(
@@ -132,6 +140,40 @@ def get_last_run(db_path: Path, run_type: str | None = None) -> TrainingRun | No
         model_name=row["model_name"],
         notes=row["notes"],
     )
+
+
+def get_run_by_id(db_path: Path, run_id: int) -> TrainingRun | None:
+    """Return a single training run by ID, or None if not found."""
+    conn = _conn(db_path)
+    try:
+        row = conn.execute("SELECT * FROM training_runs WHERE id = ?", (run_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return TrainingRun(
+        id=row["id"],
+        run_type=row["run_type"],
+        status=row["status"],
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+        docs_crawled=row["docs_crawled"],
+        pairs_generated=row["pairs_generated"],
+        model_name=row["model_name"],
+        notes=row["notes"],
+    )
+
+
+def delete_run(db_path: Path, run_id: int) -> bool:
+    """Delete a training run record by ID. Returns True if a row was deleted."""
+    conn = _conn(db_path)
+    try:
+        cur = conn.execute("DELETE FROM training_runs WHERE id = ?", (run_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
 
 
 def count_new_docs_since(db_path: Path, since_ts: float, reports_dir: Path) -> int:

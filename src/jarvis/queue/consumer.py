@@ -31,6 +31,7 @@ def process_task(task: QueueTask) -> QueueResult:
                 tool_schemas=base_schemas,
                 tool_registry=base_registry,
                 max_search_calls=settings.max_search_calls,
+                session_id=task.session_id,
             )
         else:
             planner_schemas, planner_registry = build_planner_registry(
@@ -44,6 +45,7 @@ def process_task(task: QueueTask) -> QueueResult:
                 max_tokens=settings.max_tokens,
                 tool_schemas=planner_schemas,
                 tool_registry=planner_registry,
+                session_id=task.session_id,
             )
 
         original_dispatch = agent._before_dispatch
@@ -66,7 +68,7 @@ def process_task(task: QueueTask) -> QueueResult:
             task_id=task.task_id,
             session_id=task.session_id,
             response=response_text,
-            usage=UsageSummary(**{k: usage.get(k, 0) for k in UsageSummary.__dataclass_fields__}),
+            usage=UsageSummary(**{k: usage.get(k, 0) for k in UsageSummary.model_fields}),
         )
 
     except Exception as exc:
