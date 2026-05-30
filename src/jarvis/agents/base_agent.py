@@ -13,8 +13,8 @@ from jarvis.telemetry.tracing import get_tracer
 
 log = structlog.get_logger()
 
-_COMPRESS_THRESHOLD = 30   # message count before compression triggers
 _COMPRESS_KEEP_RECENT = 10  # always preserve this many recent messages
+_CHARS_PER_TOKEN = 4        # rough estimate for token budgeting
 
 _HEDGE_PHRASES = frozenset([
     "i'm not sure", "i'm uncertain", "i think", "might be", "could be",
@@ -141,9 +141,21 @@ class BaseAgent(ABC):
             pass
         return response
 
+    def _context_budget_tokens(self) -> int:
+        try:
+            from jarvis.config import get_settings
+            return get_settings().context_budget_tokens
+        except Exception:
+            return 4096
+
+    @staticmethod
+    def _estimate_tokens(messages: list[dict]) -> int:
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        return total_chars // _CHARS_PER_TOKEN
+
     def _compress_history(self, messages: list[dict]) -> list[dict]:
-        """Summarize oldest messages when history exceeds the compression threshold."""
-        if len(messages) <= _COMPRESS_THRESHOLD:
+        """Summarize oldest messages when estimated token count exceeds the budget."""
+        if self._estimate_tokens(messages) <= self._context_budget_tokens():
             return messages
         to_compress = messages[:-_COMPRESS_KEEP_RECENT]
         recent = messages[-_COMPRESS_KEEP_RECENT:]

@@ -571,6 +571,99 @@ async def chat(req: ChatRequest, _user=Depends(_auth_dep)) -> ChatResponse:
     )
 
 
+# ── SSE streaming chat ────────────────────────────────────────────────────────
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest, _user=Depends(_auth_dep)) -> StreamingResponse:
+    """Streaming chat via Server-Sent Events.
+
+    Emits a stream of JSON-encoded SSE events:
+      data: {"type":"chunk","text":"..."}   — partial response text
+      data: {"type":"tool","name":"..."}    — tool invocation notification
+      data: {"type":"done","session_id":"...","usage":{...}}
+      data: {"type":"error","message":"..."}
+    """
+    import json as _json
+    from jarvis.api.budget import BudgetExceededError, check_budget
+
+    session_id = req.session_id or str(uuid.uuid4())
+    session = _get_session(session_id, req.researcher_mode, team_mode=req.team_mode)
+    agent = session["agent"]
+    messages = session["messages"]
+
+    db_path = get_settings().reports_dir / "jarvis.db"
+    user_id = session.get("user_id") or "anonymous"
+    try:
+        check_budget(db_path, user_id)
+    except BudgetExceededError as exc:
+        _err_msg = str(exc)  # capture before Python 3 deletes the except-as variable
+        async def _budget_err():
+            yield f"data: {_json.dumps({'type': 'error', 'message': _err_msg})}\n\n"
+        return StreamingResponse(_budget_err(), media_type="text/event-stream")
+
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def _on_chunk(text: str) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, ("chunk", text))
+
+    def _on_tool(name: str) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, ("tool", name))
+
+    _instrument_tool_dispatch(agent, on_tool_event=_on_tool)
+    messages.append({"role": "user", "content": req.message})
+
+    def _run_agent():
+        try:
+            text, updated = agent.run_turn(messages, on_chunk=_on_chunk)
+            loop.call_soon_threadsafe(queue.put_nowait, ("done", (text, updated)))
+        except Exception as exc:
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+
+    _timeout = get_settings().agent_turn_timeout_seconds
+    future = loop.run_in_executor(_executor, _run_agent)
+
+    async def _event_gen():
+        try:
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(queue.get(), timeout=_timeout + 5)
+                except asyncio.TimeoutError:
+                    yield f"data: {_json.dumps({'type': 'error', 'message': 'stream timed out'})}\n\n"
+                    return
+
+                if kind == "chunk":
+                    yield f"data: {_json.dumps({'type': 'chunk', 'text': payload})}\n\n"
+                elif kind == "tool":
+                    yield f"data: {_json.dumps({'type': 'tool', 'name': payload})}\n\n"
+                    TOOL_CALLS_TOTAL.labels(tool_name=payload).inc()
+                elif kind == "done":
+                    text, updated_messages = payload
+                    session["messages"] = updated_messages
+                    usage = agent.get_usage_summary()
+                    record_usage(usage)
+                    _log_episodes(session_id, req.message, text, user_id=user_id)
+                    _record_spend(user_id, usage["estimated_cost_usd"])
+                    REQUESTS_TOTAL.labels(mode="sse").inc()
+                    yield f"data: {_json.dumps({'type': 'done', 'session_id': session_id, 'usage': usage})}\n\n"
+                    return
+                elif kind == "error":
+                    log.error("sse_chat_error", session_id=session_id, error=payload)
+                    yield f"data: {_json.dumps({'type': 'error', 'message': payload})}\n\n"
+                    return
+        finally:
+            future.cancel()
+
+    return StreamingResponse(
+        _event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # ── WebSocket ──────────────────────────────────────────────────────────────────
 
 @app.websocket("/api/ws/{session_id}")
@@ -2076,6 +2169,106 @@ async def parallel_map_stream(
         yield f"data: {_json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(_event_generator(), media_type="text/event-stream")
+
+
+# ── Webhooks ──────────────────────────────────────────────────────────────────
+
+@app.post("/api/webhooks", status_code=201)
+async def create_webhook(body: dict, _user=Depends(_auth_dep)) -> dict:
+    """Register an HTTP callback for system events.
+
+    Body: {"url": "https://...", "events": ["schedule.complete", ...], "secret": "optional"}
+    Valid events: schedule.complete, eval.complete, training.complete, tool.error, chat.complete
+    """
+    from jarvis.events.webhooks import register_webhook
+    url = body.get("url", "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=422, detail="url must start with http:// or https://")
+    events = body.get("events", [])
+    if not events:
+        raise HTTPException(status_code=422, detail="events list must not be empty")
+    secret = body.get("secret")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    try:
+        return register_webhook(db_path, url, events, secret)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.get("/api/webhooks")
+async def list_webhooks_endpoint(event: str | None = None, _user=Depends(_auth_dep)) -> list[dict]:
+    """List all active webhooks, optionally filtered by event type."""
+    from jarvis.events.webhooks import list_webhooks
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return list_webhooks(db_path, event=event)
+
+
+@app.delete("/api/webhooks/{webhook_id}", status_code=204)
+async def delete_webhook_endpoint(webhook_id: str, _user=Depends(_auth_dep)) -> None:
+    """Deactivate a webhook by ID."""
+    from jarvis.events.webhooks import delete_webhook
+    db_path = get_settings().reports_dir / "jarvis.db"
+    found = delete_webhook(db_path, webhook_id)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Webhook '{webhook_id}' not found")
+
+
+@app.get("/api/webhooks/{webhook_id}/deliveries")
+async def get_webhook_deliveries(
+    webhook_id: str,
+    limit: int = 20,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return recent delivery history for a webhook."""
+    from jarvis.events.webhooks import get_deliveries
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_deliveries(db_path, webhook_id, limit=limit)
+
+
+# ── Plugin management ─────────────────────────────────────────────────────────
+
+@app.get("/api/plugins")
+async def list_plugins(_user=Depends(_auth_dep)) -> list[dict]:
+    """List all discovered plugins with enabled/disabled status."""
+    from jarvis.tools.plugin_loader import list_plugin_info
+    return list_plugin_info()
+
+
+@app.post("/api/plugins/reload", status_code=200)
+async def reload_plugins_endpoint(_user=Depends(_auth_dep)) -> dict:
+    """Force-reimport all plugin modules and rebuild the tool registry.
+
+    Returns the count of successfully loaded plugins.
+    """
+    from jarvis.tools.plugin_loader import reload_plugins
+
+    loop = asyncio.get_running_loop()
+    schemas, registry = await loop.run_in_executor(
+        _executor, reload_plugins
+    )
+    log.info("plugins_hot_reloaded", count=len(schemas))
+    return {"reloaded": len(schemas), "tools": [s["name"] for s in schemas]}
+
+
+@app.post("/api/plugins/{tool_name}/disable", status_code=200)
+async def disable_plugin_endpoint(tool_name: str, _user=Depends(_auth_dep)) -> dict:
+    """Disable a plugin by tool name (takes effect on next registry rebuild)."""
+    from jarvis.tools.plugin_loader import disable_plugin
+    found = disable_plugin(tool_name)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Plugin '{tool_name}' not found")
+    return {"tool_name": tool_name, "enabled": False}
+
+
+@app.post("/api/plugins/{tool_name}/enable", status_code=200)
+async def enable_plugin_endpoint(tool_name: str, _user=Depends(_auth_dep)) -> dict:
+    """Re-enable a previously disabled plugin."""
+    from jarvis.tools.plugin_loader import enable_plugin, list_plugin_info
+    known = {i["tool_name"] for i in list_plugin_info() if i.get("tool_name")}
+    if tool_name not in known:
+        raise HTTPException(status_code=404, detail=f"Plugin '{tool_name}' not found")
+    enable_plugin(tool_name)
+    return {"tool_name": tool_name, "enabled": True}
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

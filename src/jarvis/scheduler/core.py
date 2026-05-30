@@ -236,6 +236,9 @@ def _prune_memory_job(db_path_str: str) -> None:
         from jarvis.memory.turns import prune_old_turns
         from jarvis.security.audit import prune_old_audit
 
+        from jarvis.memory.episodic import apply_importance_decay
+        apply_importance_decay(db_path)
+
         ep_deleted = prune_old_episodes(db_path, retention)
         fb_deleted = prune_old_feedback(db_path, retention)
         fail_deleted = prune_old_failures(db_path, retention)

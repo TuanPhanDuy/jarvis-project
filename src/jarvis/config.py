@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     goal_verification_enabled: bool = Field(True, alias="JARVIS_GOAL_VERIFICATION")
     consensus_n_agents: int = Field(3, alias="JARVIS_CONSENSUS_N_AGENTS")
 
+    # Context window budgeting
+    context_budget_tokens: int = Field(4096, alias="JARVIS_CONTEXT_BUDGET_TOKENS")
+
     # Agent turn timeout
     agent_turn_timeout_seconds: int = Field(120, alias="JARVIS_AGENT_TURN_TIMEOUT")
 
