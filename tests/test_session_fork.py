@@ -8,12 +8,23 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+_TEST_SESSION_IDS = {
+    "list-test-session", "fields-test", "detail-test", "usage-test", "tools-test",
+    "delete-me", "gone-session", "totally-nonexistent",
+    "fork-source", "copy-source", "index-source", "dup-source",
+    "custom-id-source", "existing-fork-id", "meta-source",
+}
+
+
 @pytest.fixture(autouse=True)
-def reset_auth():
+def reset_auth_and_sessions():
     import jarvis.api.server as _s
     _s._require_auth = None
     yield
     _s._require_auth = None
+    # Clean up test-specific sessions to avoid polluting other tests
+    for sid in list(_TEST_SESSION_IDS):
+        _s._sessions.pop(sid, None)
 
 
 @pytest.fixture()

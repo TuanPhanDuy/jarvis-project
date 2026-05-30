@@ -201,6 +201,9 @@ async def lifespan(app: FastAPI):
         auth_enabled=settings.auth_enabled,
     )
 
+    # Restore sessions persisted before shutdown
+    _restore_persisted_sessions(settings)
+
     if settings.proactive_enabled:
         await _start_event_bus(settings)
 
@@ -327,6 +330,63 @@ def _count_user_sessions(settings, user_id: str | None) -> int:
         return row[0] if row else 0
     except Exception:
         return 0
+
+
+def _restore_persisted_sessions(settings) -> None:
+    """Load previously persisted sessions back into _sessions on startup."""
+    try:
+        from jarvis.memory.sessions import load_sessions
+        db_path = settings.reports_dir / "jarvis.db"
+        rows = load_sessions(db_path, ttl_minutes=settings.api_session_ttl_minutes)
+        for row in rows:
+            sid = row["session_id"]
+            if sid in _sessions:
+                continue
+            researcher_mode = row["agent_type"] == "ResearcherAgent"
+            team_mode = row["agent_type"] == "TeamAgent"
+            try:
+                agent = _build_agent_for_session(
+                    settings,
+                    researcher_mode=researcher_mode,
+                    team_mode=team_mode,
+                    session_id=sid,
+                    user_id=row.get("user_id"),
+                )
+                _sessions[sid] = {
+                    "agent": agent,
+                    "messages": row["messages"],
+                    "created_at": row["created_at"],
+                    "user_id": row.get("user_id"),
+                    "approval_gate": None,
+                    "fork_of": row.get("fork_of"),
+                    "forked_at": row.get("updated_at"),
+                }
+            except Exception as exc:
+                log.warning("session_restore_failed", session_id=sid, error=str(exc))
+        if rows:
+            log.info("sessions_restored", count=len(rows))
+    except Exception as exc:
+        log.warning("session_restore_error", error=str(exc))
+
+
+def _persist_session(session_id: str, session: dict, settings=None) -> None:
+    """Save a session's message history to SQLite. Best-effort — never raises."""
+    try:
+        if settings is None:
+            settings = get_settings()
+        from jarvis.memory.sessions import save_session
+        agent = session.get("agent")
+        save_session(
+            db_path=settings.reports_dir / "jarvis.db",
+            session_id=session_id,
+            messages=session.get("messages", []),
+            agent_type=type(agent).__name__ if agent else "PlannerAgent",
+            user_id=session.get("user_id"),
+            fork_of=session.get("fork_of"),
+            created_at=session.get("created_at"),
+        )
+    except Exception as exc:
+        log.warning("session_persist_failed", session_id=session_id, error=str(exc))
 
 
 def _pre_index_reports(settings) -> None:
@@ -600,6 +660,7 @@ async def chat(req: ChatRequest, _user=Depends(_auth_dep)) -> ChatResponse:
 
     _log_episodes(session_id, req.message, text_or_err, user_id=user_id)
     _record_spend(user_id, usage["estimated_cost_usd"])
+    _persist_session(session_id, session)
     log.info("chat_complete", session_id=session_id, duration_s=round(duration, 2))
     return ChatResponse(
         session_id=session_id,
@@ -681,6 +742,7 @@ async def chat_stream(req: ChatRequest, _user=Depends(_auth_dep)) -> StreamingRe
                     record_usage(usage)
                     _log_episodes(session_id, req.message, text, user_id=user_id)
                     _record_spend(user_id, usage["estimated_cost_usd"])
+                    _persist_session(session_id, session)
                     REQUESTS_TOTAL.labels(mode="sse").inc()
                     yield f"data: {_json.dumps({'type': 'done', 'session_id': session_id, 'usage': usage})}\n\n"
                     return
@@ -756,6 +818,7 @@ async def chat_structured(req: StructuredChatRequest, _user=Depends(_auth_dep)) 
     record_usage(usage)
     _log_episodes(session_id, req.message, str(payload), user_id=user_id)
     _record_spend(user_id, usage["estimated_cost_usd"])
+    _persist_session(session_id, session)
     return StructuredChatResponse(
         session_id=session_id,
         result=payload,
@@ -1464,6 +1527,11 @@ async def get_pending_approvals(session_id: str, _user=Depends(_auth_dep)) -> li
 
 def _session_info(sid: str, s: dict) -> SessionInfo:
     agent = s.get("agent")
+    try:
+        raw = agent.get_usage_summary() if agent else {}
+        usage = dict(raw) if isinstance(raw, dict) else {}
+    except Exception:
+        usage = {}
     return SessionInfo(
         session_id=sid,
         created_at=s.get("created_at", 0.0),
@@ -1471,7 +1539,7 @@ def _session_info(sid: str, s: dict) -> SessionInfo:
         user_id=s.get("user_id"),
         agent_type=type(agent).__name__ if agent else "unknown",
         last_turn_tools=list(getattr(agent, "_turn_tool_calls", [])) if agent else [],
-        usage=agent.get_usage_summary() if agent else {},
+        usage=usage,
         fork_of=s.get("fork_of"),
         forked_at=s.get("forked_at"),
     )
@@ -2448,6 +2516,7 @@ async def fork_session(
         "fork_of": session_id,
         "forked_at": time.time(),
     }
+    _persist_session(new_sid, _sessions[new_sid])
     log.info("session_forked", source=session_id, fork=new_sid, messages_copied=len(messages))
     return {
         "session_id": new_sid,
@@ -2455,6 +2524,341 @@ async def fork_session(
         "message_count": len(messages),
         "forked_at": _sessions[new_sid]["forked_at"],
     }
+
+
+# ── Config hot-reload ─────────────────────────────────────────────────────────
+
+@app.post("/api/config/reload", status_code=200)
+async def reload_config(_user=Depends(_auth_dep)) -> dict:
+    """Re-read environment variables and update running app settings.
+
+    Propagates changes to:
+      - Auth dependency (_require_auth)
+      - Rate limiter buckets (cleared so new limits apply immediately)
+      - Scheduler cron jobs (eval + training auto-schedules)
+
+    Returns {changed: {key: {old, new}}, reloaded_at}.
+    """
+    global _require_auth
+    old_settings = get_settings()
+
+    # Force re-read env vars by reloading dotenv
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+    except Exception:
+        pass
+
+    new_settings = get_settings()
+    reloaded_at = time.time()
+
+    # Diff settings to report what changed
+    changed: dict[str, dict] = {}
+    for field in old_settings.model_fields:
+        old_val = getattr(old_settings, field, None)
+        new_val = getattr(new_settings, field, None)
+        if old_val != new_val:
+            changed[field] = {"old": str(old_val), "new": str(new_val)}
+
+    # Propagate: auth dependency
+    try:
+        from jarvis.auth.core import make_auth_dependency
+        _require_auth = make_auth_dependency(
+            db_path=new_settings.reports_dir / "jarvis.db",
+            jwt_secret=new_settings.jwt_secret,
+            auth_enabled=new_settings.auth_enabled,
+        )
+    except Exception as exc:
+        log.warning("config_reload_auth_failed", error=str(exc))
+
+    # Propagate: clear rate-limiter buckets so new limits apply immediately
+    try:
+        for mw in app.middleware_stack.app.middleware_stack.app.middleware_stack.app.__dict__.get(  # type: ignore
+            "_middleware", []
+        ):
+            pass
+        # Walk middleware stack looking for _RateLimitMiddleware
+        node = app.middleware_stack
+        while hasattr(node, "app"):
+            if hasattr(node, "_buckets") and hasattr(node, "_max_calls"):
+                node._buckets.clear()
+                new_max, new_window = _parse_rate(new_settings.chat_rate_limit)
+                node._max_calls = new_max
+                node._window = new_window
+                break
+            node = node.app
+    except Exception:
+        pass
+
+    log.info("config_reloaded", changed_keys=list(changed.keys()))
+    return {"changed": changed, "reloaded_at": reloaded_at}
+
+
+# ── Notification center ────────────────────────────────────────────────────────
+
+@app.get("/api/notifications")
+async def list_notifications(
+    unread_only: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return system notifications, newest-first."""
+    from jarvis.events.notifications import list_notifications as _list
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return _list(db_path, unread_only=unread_only, limit=limit, offset=offset)
+
+
+@app.get("/api/notifications/unread-count")
+async def get_unread_count(_user=Depends(_auth_dep)) -> dict:
+    """Return the number of unread notifications."""
+    from jarvis.events.notifications import unread_count
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return {"unread": unread_count(db_path)}
+
+
+@app.patch("/api/notifications/{notification_id}/read", status_code=200)
+async def mark_notification_read(notification_id: str, _user=Depends(_auth_dep)) -> dict:
+    """Mark a notification as read."""
+    from jarvis.events.notifications import mark_read
+    db_path = get_settings().reports_dir / "jarvis.db"
+    found = mark_read(db_path, notification_id)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Notification '{notification_id}' not found")
+    return {"id": notification_id, "read": True}
+
+
+@app.delete("/api/notifications", status_code=200)
+async def clear_notifications(_user=Depends(_auth_dep)) -> dict:
+    """Delete all read notifications. Returns count deleted."""
+    from jarvis.events.notifications import clear_read
+    db_path = get_settings().reports_dir / "jarvis.db"
+    deleted = clear_read(db_path)
+    return {"deleted": deleted}
+
+
+@app.post("/api/notifications", status_code=201)
+async def create_notification(body: dict, _user=Depends(_auth_dep)) -> dict:
+    """Push a manual system notification (useful for testing or admin alerts)."""
+    from jarvis.events.notifications import push_notification
+    title = body.get("title", "").strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="title must not be empty")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return push_notification(
+        db_path,
+        event=body.get("event", "system.info"),
+        title=title,
+        body=body.get("body", ""),
+        severity=body.get("severity", "info"),
+    )
+
+
+# ── Agent pipeline ────────────────────────────────────────────────────────────
+
+_PIPELINE_AGENT_TYPES = frozenset(["planner", "researcher", "coder", "qa", "analyst", "devops"])
+
+
+@app.post("/api/pipeline", status_code=200)
+async def run_pipeline(body: dict, _user=Depends(_auth_dep)) -> dict:
+    """Run a multi-agent pipeline where each step's output feeds the next step's input.
+
+    Body:
+      prompt:  str           — initial user message
+      steps:   list[{agent_type: str, instructions?: str}]
+      session_id?: str       — optional session to attach the result to
+      timeout_seconds?: float (default: agent_turn_timeout_seconds × len(steps))
+
+    Each step receives:
+      "[Previous output]\\n{prior_step_output}\\n\\n[Task]\\n{instructions or prompt}"
+
+    Returns:
+      {steps: [{agent_type, output, usage}], final_output: str, total_usage: dict}
+    """
+    prompt: str = body.get("prompt", "").strip()
+    if not prompt:
+        raise HTTPException(status_code=422, detail="prompt must not be empty")
+
+    steps_spec: list[dict] = body.get("steps", [])
+    if not steps_spec or not isinstance(steps_spec, list):
+        raise HTTPException(status_code=422, detail="steps must be a non-empty list")
+
+    unknown = [s["agent_type"] for s in steps_spec if s.get("agent_type") not in _PIPELINE_AGENT_TYPES]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown agent_type(s): {unknown}. Valid: {sorted(_PIPELINE_AGENT_TYPES)}",
+        )
+
+    settings = get_settings()
+    per_step_timeout = settings.agent_turn_timeout_seconds
+    total_timeout = float(body.get("timeout_seconds") or per_step_timeout * len(steps_spec))
+
+    loop = asyncio.get_running_loop()
+    step_results: list[dict] = []
+    current_input = prompt
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    def _run_step(agent_type: str, instructions: str | None, user_input: str) -> tuple[str, dict]:
+        researcher_mode = agent_type == "researcher"
+        team_mode = False
+        coder_mode = agent_type == "coder"
+        analyst_mode = agent_type == "analyst"
+        devops_mode = agent_type == "devops"
+        qa_mode = agent_type == "qa"
+
+        step_sid = str(uuid.uuid4())
+        agent = _build_agent_for_session(
+            settings,
+            researcher_mode=researcher_mode,
+            team_mode=team_mode,
+            session_id=step_sid,
+        )
+        msg_content = (
+            f"[Previous output]\n{user_input}\n\n[Task]\n{instructions}"
+            if instructions and user_input != prompt
+            else (instructions or user_input)
+        )
+        msgs = [{"role": "user", "content": msg_content}]
+        output, _ = agent.run_turn(msgs)
+        usage = agent.get_usage_summary()
+        return output, usage
+
+    async def _run_pipeline() -> None:
+        nonlocal current_input, total_input_tokens, total_output_tokens
+        for spec in steps_spec:
+            agent_type = spec["agent_type"]
+            instructions = spec.get("instructions")
+            output, usage = await asyncio.wait_for(
+                loop.run_in_executor(_executor, _run_step, agent_type, instructions, current_input),
+                timeout=per_step_timeout,
+            )
+            step_results.append({"agent_type": agent_type, "output": output, "usage": usage})
+            total_input_tokens += usage.get("input_tokens", 0)
+            total_output_tokens += usage.get("output_tokens", 0)
+            current_input = output  # chain: this step's output → next step's input
+
+    try:
+        await asyncio.wait_for(_run_pipeline(), timeout=total_timeout)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Pipeline timed out")
+
+    return {
+        "steps": step_results,
+        "final_output": current_input,
+        "total_usage": {
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "estimated_cost_usd": 0.0,
+        },
+    }
+
+
+# ── Conversation export / import ──────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/export")
+async def export_session(session_id: str, _user=Depends(_auth_dep)) -> dict:
+    """Export a session as a self-contained JSON bundle.
+
+    The bundle can be imported with POST /api/sessions/import on any instance.
+    Bundle schema: {session_id, agent_type, user_id, messages, fork_of, exported_at}
+    """
+    session = _sessions.get(session_id)
+    if session is None:
+        # Try loading from persistence
+        from jarvis.memory.sessions import load_sessions
+        db_path = get_settings().reports_dir / "jarvis.db"
+        rows = load_sessions(db_path, ttl_minutes=99999)
+        row = next((r for r in rows if r["session_id"] == session_id), None)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+        return {
+            "session_id": row["session_id"],
+            "agent_type": row["agent_type"],
+            "user_id": row["user_id"],
+            "messages": row["messages"],
+            "fork_of": row["fork_of"],
+            "exported_at": time.time(),
+        }
+    agent = session.get("agent")
+    return {
+        "session_id": session_id,
+        "agent_type": type(agent).__name__ if agent else "PlannerAgent",
+        "user_id": session.get("user_id"),
+        "messages": session.get("messages", []),
+        "fork_of": session.get("fork_of"),
+        "exported_at": time.time(),
+    }
+
+
+@app.post("/api/sessions/import", status_code=201)
+async def import_session(bundle: dict, _user=Depends(_auth_dep)) -> dict:
+    """Import a conversation bundle exported by GET /api/sessions/{id}/export.
+
+    Creates (or replaces) a session with the provided message history.
+    The session_id from the bundle is reused unless new_session_id is provided in the body.
+    """
+    messages = bundle.get("messages", [])
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=422, detail="messages must be a list")
+
+    orig_sid = bundle.get("session_id", "")
+    new_sid = bundle.get("new_session_id") or orig_sid or str(uuid.uuid4())
+    agent_type = bundle.get("agent_type", "PlannerAgent")
+    user_id = bundle.get("user_id")
+
+    settings = get_settings()
+    researcher_mode = agent_type == "ResearcherAgent"
+    team_mode = agent_type == "TeamAgent"
+    agent = _build_agent_for_session(
+        settings,
+        researcher_mode=researcher_mode,
+        team_mode=team_mode,
+        session_id=new_sid,
+        user_id=user_id,
+    )
+    _sessions[new_sid] = {
+        "agent": agent,
+        "messages": messages,
+        "created_at": time.time(),
+        "user_id": user_id,
+        "approval_gate": None,
+        "fork_of": bundle.get("fork_of"),
+        "forked_at": None,
+    }
+    _persist_session(new_sid, _sessions[new_sid])
+    log.info("session_imported", session_id=new_sid, messages=len(messages))
+    return {
+        "session_id": new_sid,
+        "agent_type": agent_type,
+        "message_count": len(messages),
+        "imported_at": time.time(),
+    }
+
+
+# ── Session history ────────────────────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/history")
+async def get_session_history(
+    session_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return paginated message history for a session (newest-first).
+
+    Falls back to the in-memory session if the session has not been persisted yet.
+    """
+    from jarvis.memory.sessions import get_session_history as _get_history
+    db_path = get_settings().reports_dir / "jarvis.db"
+    rows = _get_history(db_path, session_id, limit=limit, offset=offset)
+    if not rows and session_id in _sessions:
+        msgs = list(reversed(_sessions[session_id].get("messages", [])))
+        rows = msgs[offset: offset + limit]
+    if not rows and session_id not in _sessions:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    return rows
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
