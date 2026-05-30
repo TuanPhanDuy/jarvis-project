@@ -24,6 +24,27 @@ log = structlog.get_logger()
 _scheduler = None
 
 
+def _fire(
+    event: str,
+    payload: dict,
+    db_path: Path,
+    title: str,
+    severity: str = "info",
+) -> None:
+    """Best-effort: push a notification and fire matching webhooks. Never raises."""
+    try:
+        from jarvis.events.notifications import push_notification
+        push_notification(db_path, event=event, title=title, severity=severity,
+                          body=str(payload))
+    except Exception:
+        pass
+    try:
+        from jarvis.events.webhooks import fire_event
+        fire_event(db_path, event=event, payload=payload)
+    except Exception:
+        pass
+
+
 # ── Job functions ─────────────────────────────────────────────────────────────
 # Must be module-level so APScheduler can pickle/restore them across restarts.
 
@@ -90,8 +111,12 @@ def _auto_crawl_job(db_path_str: str, reports_dir_str: str) -> None:
         complete_run(db_path, run_id, docs_crawled=total,
                      notes=f"topics: {settings.auto_training_topics}")
         log.info("auto_crawl_complete", docs=total)
+        _fire("training.complete", {"type": "crawl", "docs": total}, db_path,
+              f"Research crawl complete — {total} documents indexed")
     except Exception as exc:
         log.error("auto_crawl_failed", error=str(exc))
+        _fire("tool.error", {"job": "auto_crawl", "error": str(exc)}, Path(db_path_str),
+              f"Research crawl failed: {exc}", severity="error")
         try:
             if run_id >= 0:
                 complete_run(Path(db_path_str), run_id, status="failed", notes=str(exc))
@@ -150,8 +175,12 @@ def _auto_finetune_job(db_path_str: str, reports_dir_str: str) -> None:
             notes="auto-finetune" + ("" if registered else " (registration failed)"),
         )
         log.info("auto_finetune_complete", model=model_name, pairs=pairs)
+        _fire("training.complete", {"type": "finetune", "model": model_name, "pairs": pairs},
+              db_path, f"Fine-tune complete — model '{model_name}' trained on {pairs} pairs")
     except Exception as exc:
         log.error("auto_finetune_failed", error=str(exc))
+        _fire("tool.error", {"job": "auto_finetune", "error": str(exc)}, Path(db_path_str),
+              f"Fine-tune failed: {exc}", severity="error")
         try:
             if run_id >= 0:
                 complete_run(Path(db_path_str), run_id, status="failed", notes=str(exc))

@@ -2122,7 +2122,19 @@ async def run_evals(
         persist_results(results, summary, settings.reports_dir)
 
         run_id = str(_uuid.uuid4())[:8]
-        return EvalRunResponse(
+        result_dicts = [
+            {
+                "case_id": r.case_id, "overall_pass": r.overall_pass,
+                "contains_pass": r.contains_pass, "forbidden_pass": r.forbidden_pass,
+                "latency_s": r.latency_s, "cost_usd": r.cost_usd,
+                "judge_score": r.judge_score, "error": r.error,
+            }
+            for r in results
+        ]
+        # Persist to trend table
+        from jarvis.evals.trend import record_run
+        record_run(
+            db_path=settings.reports_dir / "jarvis.db",
             run_id=run_id,
             total=summary["total"],
             passed=summary["passed"],
@@ -2131,20 +2143,35 @@ async def run_evals(
             avg_latency_s=summary["avg_latency_s"],
             total_cost_usd=summary["total_cost_usd"],
             avg_judge_score=summary.get("avg_judge_score"),
-            results=[
-                EvalResultItem(
-                    case_id=r.case_id,
-                    overall_pass=r.overall_pass,
-                    contains_pass=r.contains_pass,
-                    forbidden_pass=r.forbidden_pass,
-                    latency_s=r.latency_s,
-                    cost_usd=r.cost_usd,
-                    judge_score=r.judge_score,
-                    error=r.error,
-                )
-                for r in results
-            ],
+            tags=body.tags,
+            results=result_dicts,
         )
+        response = EvalRunResponse(
+            run_id=run_id,
+            total=summary["total"],
+            passed=summary["passed"],
+            failed=summary["failed"],
+            pass_rate=summary["pass_rate"],
+            avg_latency_s=summary["avg_latency_s"],
+            total_cost_usd=summary["total_cost_usd"],
+            avg_judge_score=summary.get("avg_judge_score"),
+            results=[EvalResultItem(**d) for d in result_dicts],
+        )
+        # Fire notification + webhooks
+        try:
+            from jarvis.events.notifications import push_notification
+            from jarvis.events.webhooks import fire_event
+            _db = settings.reports_dir / "jarvis.db"
+            _title = f"Eval run {run_id}: {summary['passed']}/{summary['total']} passed ({summary['pass_rate']:.0%})"
+            _sev = "info" if summary["pass_rate"] >= 0.8 else "warning"
+            push_notification(_db, event="eval.complete", title=_title, severity=_sev)
+            fire_event(_db, "eval.complete", {
+                "run_id": run_id, "pass_rate": summary["pass_rate"],
+                "passed": summary["passed"], "total": summary["total"],
+            })
+        except Exception:
+            pass
+        return response
 
     loop = asyncio.get_running_loop()
     try:
@@ -2245,6 +2272,169 @@ async def delete_eval_case(case_id: str, _user=Depends(_auth_dep)) -> None:
         raise HTTPException(status_code=404, detail=f"Eval case '{case_id}' not found")
     _save_eval_cases(remaining)
     log.info("eval_case_deleted", case_id=case_id)
+
+
+# ── Unified memory search ─────────────────────────────────────────────────────
+
+@app.get("/api/memory/search")
+async def memory_search(
+    q: str,
+    type: str | None = None,
+    limit: int = 20,
+    user_id: str | None = None,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Fan-out search across all memory subsystems.
+
+    type: "episodic" | "graph" | "reports" | None (all three)
+    Returns {episodic: [...], graph: [...], reports: [...]}
+    """
+    if not q.strip():
+        raise HTTPException(status_code=422, detail="q must not be empty")
+
+    settings = get_settings()
+    db_path = settings.reports_dir / "jarvis.db"
+    result: dict[str, list] = {"episodic": [], "graph": [], "reports": []}
+    wanted = {type} if type else {"episodic", "graph", "reports"}
+
+    if "episodic" in wanted:
+        try:
+            from jarvis.memory.episodic import search_episodes
+            rows = search_episodes(db_path, q, limit=limit, user_id=user_id)
+            result["episodic"] = [
+                {
+                    "id": r.get("id"), "role": r.get("role"),
+                    "content": str(r.get("content", ""))[:400],
+                    "timestamp": r.get("timestamp"),
+                    "session_id": r.get("session_id"),
+                    "importance": r.get("importance", 1.0),
+                }
+                for r in rows
+            ]
+        except Exception:
+            pass
+
+    if "graph" in wanted:
+        try:
+            from jarvis.memory.graph import handle_query_knowledge_graph
+            raw = handle_query_knowledge_graph(
+                {"entity": q.split()[0] if q.split() else q, "depth": 2}, db_path
+            )
+            result["graph"] = [{"text": raw}] if raw and not raw.startswith("No ") else []
+        except Exception:
+            pass
+
+    if "reports" in wanted:
+        try:
+            from jarvis.tools.memory import handle_search_memory
+            raw = handle_search_memory({"query": q, "limit": limit}, settings.reports_dir)
+            result["reports"] = [{"text": raw}] if raw and not raw.startswith("No research") else []
+        except Exception:
+            pass
+
+    return result
+
+
+# ── Tool registry introspection ───────────────────────────────────────────────
+
+@app.get("/api/tools")
+async def list_tools(_user=Depends(_auth_dep)) -> list[dict]:
+    """List all registered tools (core + plugins) with name, description, and enabled status."""
+    from jarvis.tools.plugin_loader import _disabled as _disabled_plugins
+    settings = get_settings()
+    schemas, _ = build_registry(
+        reports_dir=settings.reports_dir,
+        allowed_commands=settings.allowed_commands,
+    )
+    return [
+        {
+            "name": s["name"],
+            "description": s.get("description", ""),
+            "enabled": s["name"] not in _disabled_plugins,
+            "input_schema": s.get("input_schema", {}),
+        }
+        for s in schemas
+    ]
+
+
+@app.get("/api/tools/metrics")
+async def get_tool_metrics(
+    since_hours: float = 24.0,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return per-tool stats from the audit log for the last since_hours hours.
+
+    Each entry: {tool_name, call_count, avg_duration_ms, error_rate, last_called_at}
+    """
+    import time as _time
+    since_ts = _time.time() - since_hours * 3600
+    db_path = get_settings().reports_dir / "jarvis.db"
+    if not db_path.exists():
+        return []
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT tool_name,
+                      COUNT(*) AS call_count,
+                      AVG(duration_ms) AS avg_duration_ms,
+                      SUM(CASE WHEN result_ok = 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS error_rate,
+                      MAX(timestamp) AS last_called_at
+               FROM audit_log
+               WHERE timestamp >= ?
+               GROUP BY tool_name
+               ORDER BY call_count DESC""",
+            (since_ts,),
+        ).fetchall()
+        conn.close()
+        return [
+            {
+                "tool_name": r["tool_name"],
+                "call_count": r["call_count"],
+                "avg_duration_ms": round(r["avg_duration_ms"] or 0, 1),
+                "error_rate": round(r["error_rate"] or 0, 4),
+                "last_called_at": r["last_called_at"],
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
+@app.get("/api/tools/{tool_name}")
+async def get_tool_detail(tool_name: str, _user=Depends(_auth_dep)) -> dict:
+    """Return the full JSON Schema for a single tool."""
+    settings = get_settings()
+    schemas, _ = build_registry(
+        reports_dir=settings.reports_dir,
+        allowed_commands=settings.allowed_commands,
+    )
+    schema = next((s for s in schemas if s["name"] == tool_name), None)
+    if not schema:
+        raise HTTPException(status_code=404, detail=f"Tool '{tool_name}' not found")
+    return schema
+
+
+# ── Eval trend ────────────────────────────────────────────────────────────────
+
+@app.get("/api/evals/trend")
+async def get_eval_trend(last_n: int = 10, _user=Depends(_auth_dep)) -> list[dict]:
+    """Return the last N eval run summaries ordered newest-first for trend analysis."""
+    from jarvis.evals.trend import get_trend
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_trend(db_path, last_n=last_n)
+
+
+@app.get("/api/evals/runs/{run_id}")
+async def get_eval_run(run_id: str, _user=Depends(_auth_dep)) -> dict:
+    """Return full details (including per-case results) for a single eval run."""
+    from jarvis.evals.trend import get_run
+    db_path = get_settings().reports_dir / "jarvis.db"
+    record = get_run(db_path, run_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"Eval run '{run_id}' not found")
+    return record
 
 
 # ── Parallel map SSE ─────────────────────────────────────────────────────────
@@ -2859,6 +3049,107 @@ async def get_session_history(
     if not rows and session_id not in _sessions:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
     return rows
+
+
+# ── Message editing ───────────────────────────────────────────────────────────
+
+def _get_session_or_404(session_id: str) -> dict:
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    return _sessions[session_id]
+
+
+@app.patch("/api/sessions/{session_id}/messages/{index}", status_code=200)
+async def edit_message(
+    session_id: str,
+    index: int,
+    body: dict,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Edit the content of a single message in a session's history.
+
+    Body: {"content": "new text", "role": "user|assistant"  (optional)}
+    Index is 0-based; negative indices count from the end.
+    """
+    session = _get_session_or_404(session_id)
+    messages = session.get("messages", [])
+    try:
+        real_idx = index if index >= 0 else len(messages) + index
+        if real_idx < 0 or real_idx >= len(messages):
+            raise IndexError
+    except (IndexError, TypeError):
+        raise HTTPException(status_code=422, detail=f"Message index {index} out of range (len={len(messages)})")
+
+    if "content" not in body:
+        raise HTTPException(status_code=422, detail="body must include 'content'")
+
+    updated_msg = dict(messages[real_idx])
+    updated_msg["content"] = body["content"]
+    if "role" in body:
+        updated_msg["role"] = body["role"]
+    messages[real_idx] = updated_msg
+    session["messages"] = messages
+    _persist_session(session_id, session)
+    return {"index": real_idx, "message": updated_msg}
+
+
+@app.delete("/api/sessions/{session_id}/messages/{index}", status_code=200)
+async def delete_message(
+    session_id: str,
+    index: int,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Remove a single message from a session's history by index.
+
+    Returns the removed message and the new message count.
+    """
+    session = _get_session_or_404(session_id)
+    messages = session.get("messages", [])
+    try:
+        real_idx = index if index >= 0 else len(messages) + index
+        if real_idx < 0 or real_idx >= len(messages):
+            raise IndexError
+    except (IndexError, TypeError):
+        raise HTTPException(status_code=422, detail=f"Message index {index} out of range (len={len(messages)})")
+
+    removed = messages.pop(real_idx)
+    session["messages"] = messages
+    _persist_session(session_id, session)
+    return {"removed": removed, "message_count": len(messages)}
+
+
+@app.post("/api/sessions/{session_id}/messages", status_code=201)
+async def insert_message(
+    session_id: str,
+    body: dict,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Insert a message into a session's history.
+
+    Body: {"role": "user|assistant|system", "content": "...", "position": int (optional, default: append)}
+    """
+    session = _get_session_or_404(session_id)
+    role = body.get("role", "user")
+    content = body.get("content", "")
+    if not content:
+        raise HTTPException(status_code=422, detail="content must not be empty")
+
+    messages = session.get("messages", [])
+    new_msg = {"role": role, "content": content}
+    position = body.get("position")
+    if position is None:
+        messages.append(new_msg)
+        real_idx = len(messages) - 1
+    else:
+        try:
+            real_idx = int(position)
+            messages.insert(real_idx, new_msg)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="position must be an integer")
+
+    session["messages"] = messages
+    _persist_session(session_id, session)
+    return {"index": real_idx, "message": new_msg, "message_count": len(messages)}
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
