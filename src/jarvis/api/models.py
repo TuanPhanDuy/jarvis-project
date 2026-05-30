@@ -200,6 +200,11 @@ class SessionInfo(BaseModel):
     created_at: float
     message_count: int
     user_id: str | None = None
+    agent_type: str = "unknown"
+    last_turn_tools: list[str] = []
+    usage: dict = {}
+    fork_of: str | None = None
+    forked_at: float | None = None
 
 
 # ── Parallel map ─────────────────────────────────────────────────────────────
@@ -210,6 +215,22 @@ class ParallelMapRequest(BaseModel):
     agent_type: str = Field("researcher", description="researcher|coder|qa|analyst|devops")
     synthesize: bool = Field(True, description="Synthesise all results at the end")
     timeout_seconds: float | None = Field(None)
+
+
+# ── Structured output ────────────────────────────────────────────────────────
+
+class StructuredChatRequest(BaseModel):
+    message: str = Field(..., description="User message")
+    json_schema: dict = Field(..., description="JSON Schema the response must conform to")
+    session_id: str | None = Field(None)
+    researcher_mode: bool = False
+    team_mode: bool = False
+
+
+class StructuredChatResponse(BaseModel):
+    session_id: str
+    result: dict
+    usage: UsageSummary
 
 
 # ── Evals ────────────────────────────────────────────────────────────────────

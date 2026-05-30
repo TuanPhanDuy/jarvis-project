@@ -145,6 +145,74 @@ def get_audit_stats(db_path: Path, since_ts: float | None = None) -> dict:
                 "top_tools": [], "risk_breakdown": {}}
 
 
+def get_session_timeline(db_path: Path, session_id: str) -> list[dict]:
+    """Return ordered tool-call timeline for a session.
+
+    Each entry: {tool, timestamp, duration_ms, risk_level, result_ok}.
+    Ordered oldest-first so callers can reconstruct the execution sequence.
+    """
+    try:
+        conn = _get_conn(db_path)
+        try:
+            rows = conn.execute(
+                """SELECT tool_name, timestamp, duration_ms, risk_level, result_ok
+                   FROM audit_log
+                   WHERE session_id = ?
+                   ORDER BY timestamp ASC""",
+                (session_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [
+            {
+                "tool": r["tool_name"],
+                "timestamp": r["timestamp"],
+                "duration_ms": r["duration_ms"],
+                "risk_level": r["risk_level"],
+                "result_ok": bool(r["result_ok"]),
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
+def get_slow_tools(db_path: Path, threshold_ms: float = 5000.0) -> list[dict]:
+    """Return tools whose average duration exceeds threshold_ms.
+
+    Returns list of {tool_name, avg_duration_ms, call_count, max_duration_ms},
+    sorted by avg_duration_ms descending.
+    """
+    try:
+        conn = _get_conn(db_path)
+        try:
+            rows = conn.execute(
+                """SELECT tool_name,
+                          AVG(duration_ms) AS avg_ms,
+                          COUNT(*) AS call_count,
+                          MAX(duration_ms) AS max_ms
+                   FROM audit_log
+                   WHERE duration_ms IS NOT NULL
+                   GROUP BY tool_name
+                   HAVING AVG(duration_ms) > ?
+                   ORDER BY avg_ms DESC""",
+                (threshold_ms,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [
+            {
+                "tool_name": r["tool_name"],
+                "avg_duration_ms": round(r["avg_ms"], 1),
+                "call_count": r["call_count"],
+                "max_duration_ms": round(r["max_ms"], 1),
+            }
+            for r in rows
+        ]
+    except Exception:
+        return []
+
+
 def get_recent_audit(
     db_path: Path,
     limit: int = 50,

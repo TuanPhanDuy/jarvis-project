@@ -41,6 +41,8 @@ from jarvis.api.models import (
     BudgetStatusResponse,
     ChatRequest,
     ChatResponse,
+    StructuredChatRequest,
+    StructuredChatResponse,
     ComponentStatus,
     EvalRunRequest,
     EvalRunResponse,
@@ -109,24 +111,52 @@ def _parse_rate(rate_str: str) -> tuple[int, float]:
 
 
 class _RateLimitMiddleware(BaseHTTPMiddleware):
-    """Per-IP sliding-window rate limiter applied to chat endpoints."""
+    """Sliding-window rate limiter applied to chat endpoints.
 
-    _RATE_LIMITED_PATHS = {"/api/chat"}
+    When per_user=True and auth is enabled, buckets are keyed by user_id extracted
+    from the JWT Authorization header.  Falls back to per-IP keying when auth is
+    disabled or the token is missing/invalid.
+    """
 
-    def __init__(self, app, max_calls: int, window_seconds: float, enabled: bool) -> None:
+    _RATE_LIMITED_PATHS = {"/api/chat", "/api/chat/stream"}
+
+    def __init__(
+        self,
+        app,
+        max_calls: int,
+        window_seconds: float,
+        enabled: bool,
+        per_user: bool = False,
+    ) -> None:
         super().__init__(app)
         self._max_calls = max_calls
         self._window = window_seconds
         self._enabled = enabled
+        self._per_user = per_user
         self._buckets: dict[str, collections.deque] = collections.defaultdict(collections.deque)
+
+    def _bucket_key(self, request: Request) -> str:
+        if self._per_user:
+            auth = request.headers.get("authorization", "")
+            if auth.lower().startswith("bearer "):
+                token = auth[7:]
+                try:
+                    from jarvis.auth.core import verify_token
+                    settings = get_settings()
+                    user = verify_token(token, settings.jwt_secret)
+                    if user:
+                        return f"user:{user.username}"
+                except Exception:
+                    pass
+        return f"ip:{request.client.host if request.client else 'unknown'}"
 
     async def dispatch(self, request: Request, call_next):
         if not self._enabled or request.url.path not in self._RATE_LIMITED_PATHS:
             return await call_next(request)
 
-        ip = request.client.host if request.client else "unknown"
+        key = self._bucket_key(request)
         now = time.monotonic()
-        bucket = self._buckets[ip]
+        bucket = self._buckets[key]
 
         while bucket and bucket[0] < now - self._window:
             bucket.popleft()
@@ -207,8 +237,15 @@ app.add_middleware(
 )
 
 _rl_enabled = _os.getenv("JARVIS_RATE_LIMIT_ENABLED", "false").lower() == "true"
+_rl_per_user = _os.getenv("JARVIS_RATE_LIMIT_PER_USER", "false").lower() == "true"
 _rl_max, _rl_window = _parse_rate(_os.getenv("JARVIS_CHAT_RATE_LIMIT", "30/minute"))
-app.add_middleware(_RateLimitMiddleware, max_calls=_rl_max, window_seconds=_rl_window, enabled=_rl_enabled)
+app.add_middleware(
+    _RateLimitMiddleware,
+    max_calls=_rl_max,
+    window_seconds=_rl_window,
+    enabled=_rl_enabled,
+    per_user=_rl_per_user,
+)
 
 
 _require_auth = None  # set in lifespan; callable FastAPI dependency
@@ -661,6 +698,68 @@ async def chat_stream(req: ChatRequest, _user=Depends(_auth_dep)) -> StreamingRe
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+# ── Structured output ─────────────────────────────────────────────────────────
+
+@app.post("/api/chat/structured", response_model=StructuredChatResponse)
+async def chat_structured(req: StructuredChatRequest, _user=Depends(_auth_dep)) -> StructuredChatResponse:
+    """Single-turn chat that returns a JSON object matching the provided JSON Schema.
+
+    The model is instructed via system prompt + Ollama's native format parameter
+    to respond with valid JSON.  Returns 422 if the model output cannot be parsed.
+    """
+    from jarvis.api.budget import BudgetExceededError, check_budget
+
+    session_id = req.session_id or str(uuid.uuid4())
+    session = _get_session(session_id, req.researcher_mode, team_mode=req.team_mode)
+    agent = session["agent"]
+    messages = session["messages"]
+
+    db_path = get_settings().reports_dir / "jarvis.db"
+    user_id = session.get("user_id") or "anonymous"
+    try:
+        check_budget(db_path, user_id)
+    except BudgetExceededError as exc:
+        raise HTTPException(status_code=402, detail=str(exc))
+
+    _instrument_tool_dispatch(agent)
+    messages.append({"role": "user", "content": req.message})
+
+    loop = asyncio.get_running_loop()
+    result_holder: list = []
+
+    def run():
+        try:
+            parsed, updated = agent.run_turn_structured(messages, req.json_schema)
+            result_holder.append(("ok", parsed, updated))
+        except ValueError as exc:
+            result_holder.append(("parse_error", str(exc), messages))
+        except Exception as exc:
+            result_holder.append(("err", str(exc), messages))
+
+    _timeout = get_settings().agent_turn_timeout_seconds
+    try:
+        await asyncio.wait_for(loop.run_in_executor(_executor, run), timeout=_timeout)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"Agent turn timed out after {_timeout}s")
+
+    status, payload, updated_messages = result_holder[0]
+    if status == "parse_error":
+        raise HTTPException(status_code=422, detail=payload)
+    if status == "err":
+        raise HTTPException(status_code=500, detail=payload)
+
+    session["messages"] = updated_messages
+    usage = agent.get_usage_summary()
+    record_usage(usage)
+    _log_episodes(session_id, req.message, str(payload), user_id=user_id)
+    _record_spend(user_id, usage["estimated_cost_usd"])
+    return StructuredChatResponse(
+        session_id=session_id,
+        result=payload,
+        usage=UsageSummary(**usage),
     )
 
 
@@ -1363,32 +1462,38 @@ async def get_pending_approvals(session_id: str, _user=Depends(_auth_dep)) -> li
 
 # ── Session management endpoints ─────────────────────────────────────────────
 
+def _session_info(sid: str, s: dict) -> SessionInfo:
+    agent = s.get("agent")
+    return SessionInfo(
+        session_id=sid,
+        created_at=s.get("created_at", 0.0),
+        message_count=len(s.get("messages", [])),
+        user_id=s.get("user_id"),
+        agent_type=type(agent).__name__ if agent else "unknown",
+        last_turn_tools=list(getattr(agent, "_turn_tool_calls", [])) if agent else [],
+        usage=agent.get_usage_summary() if agent else {},
+        fork_of=s.get("fork_of"),
+        forked_at=s.get("forked_at"),
+    )
+
+
 @app.get("/api/sessions", response_model=list[SessionInfo])
 async def list_sessions(_user=Depends(_auth_dep)) -> list[SessionInfo]:
     """List all currently active in-memory sessions."""
-    return [
-        SessionInfo(
-            session_id=sid,
-            created_at=s["created_at"],
-            message_count=len(s.get("messages", [])),
-            user_id=s.get("user_id"),
-        )
-        for sid, s in _sessions.items()
-    ]
+    return sorted(
+        [_session_info(sid, s) for sid, s in _sessions.items()],
+        key=lambda x: x.created_at,
+        reverse=True,
+    )
 
 
 @app.get("/api/sessions/{session_id}", response_model=SessionInfo)
 async def get_session(session_id: str, _user=Depends(_auth_dep)) -> SessionInfo:
-    """Return metadata for a specific session."""
+    """Return metadata and usage for a specific session."""
     session = _sessions.get(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
-    return SessionInfo(
-        session_id=session_id,
-        created_at=session["created_at"],
-        message_count=len(session.get("messages", [])),
-        user_id=session.get("user_id"),
-    )
+    return _session_info(session_id, session)
 
 
 @app.delete("/api/sessions/{session_id}", status_code=204)
@@ -2269,6 +2374,87 @@ async def enable_plugin_endpoint(tool_name: str, _user=Depends(_auth_dep)) -> di
         raise HTTPException(status_code=404, detail=f"Plugin '{tool_name}' not found")
     enable_plugin(tool_name)
     return {"tool_name": tool_name, "enabled": True}
+
+
+# ── Audit timeline ────────────────────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/timeline")
+async def get_session_timeline(session_id: str, _user=Depends(_auth_dep)) -> list[dict]:
+    """Return the ordered tool-call timeline for a session from the audit log."""
+    from jarvis.security.audit import get_session_timeline
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_session_timeline(db_path, session_id)
+
+
+@app.get("/api/audit/slow-tools")
+async def get_slow_tools(
+    threshold_ms: float = 5000.0,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return tools whose average execution time exceeds threshold_ms (default 5000ms)."""
+    from jarvis.security.audit import get_slow_tools
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_slow_tools(db_path, threshold_ms=threshold_ms)
+
+
+# ── Session fork ──────────────────────────────────────────────────────────────
+
+@app.post("/api/sessions/{session_id}/fork", status_code=201)
+async def fork_session(
+    session_id: str,
+    body: dict = {},
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Fork a session, copying its message history into a new independent session.
+
+    Body (optional):
+      message_index: int — copy only messages[:message_index] (default: all)
+      new_session_id: str — explicit ID for the fork (default: auto-generated UUID)
+    """
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+
+    source = _sessions[session_id]
+    messages = list(source.get("messages", []))
+    idx = body.get("message_index")
+    if idx is not None:
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="message_index must be an integer")
+        messages = messages[:idx]
+
+    new_sid = body.get("new_session_id") or str(uuid.uuid4())
+    if new_sid in _sessions:
+        raise HTTPException(status_code=409, detail=f"Session '{new_sid}' already exists")
+
+    settings = get_settings()
+    researcher_mode = isinstance(source.get("agent"), ResearcherAgent)
+    team_mode = isinstance(source.get("agent"), TeamAgent)
+    new_agent = _build_agent_for_session(
+        settings,
+        researcher_mode=researcher_mode,
+        team_mode=team_mode,
+        session_id=new_sid,
+        user_id=source.get("user_id"),
+        approval_gate=source.get("approval_gate"),
+    )
+    _sessions[new_sid] = {
+        "agent": new_agent,
+        "messages": messages,
+        "created_at": time.time(),
+        "user_id": source.get("user_id"),
+        "approval_gate": source.get("approval_gate"),
+        "fork_of": session_id,
+        "forked_at": time.time(),
+    }
+    log.info("session_forked", source=session_id, fork=new_sid, messages_copied=len(messages))
+    return {
+        "session_id": new_sid,
+        "fork_of": session_id,
+        "message_count": len(messages),
+        "forked_at": _sessions[new_sid]["forked_at"],
+    }
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

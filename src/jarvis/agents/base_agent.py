@@ -180,6 +180,52 @@ class BaseAgent(ABC):
         except Exception:
             return recent  # fallback: truncate without summary
 
+    def run_turn_structured(
+        self,
+        messages: list[dict],
+        json_schema: dict,
+    ) -> tuple[dict, list[dict]]:
+        """Run a single turn and return a parsed JSON object matching json_schema.
+
+        Uses Ollama's native format parameter when available; falls back to a
+        prompt-level instruction asking for JSON.  Returns (parsed_dict, updated_messages).
+        Raises ValueError if the model output cannot be parsed as JSON.
+        """
+        import json as _json
+
+        messages = self._compress_history(messages)
+        messages = self._surface_memory_context(messages)
+        system = self.get_system_prompt()
+        schema_hint = _json.dumps(json_schema, indent=2)
+        json_instruction = (
+            f"\n\nRespond ONLY with a valid JSON object matching this schema:\n{schema_hint}\n"
+            "Do not include any text outside the JSON."
+        )
+        all_messages = [{"role": "system", "content": system + json_instruction}] + messages
+        model = self._router.select(messages, agent_type=self._agent_type_key())
+        try:
+            response = ollama.chat(
+                model=model,
+                messages=all_messages,
+                format="json",
+                options={"num_predict": self._max_tokens},
+            )
+        except Exception:
+            response = ollama.chat(
+                model=model,
+                messages=all_messages,
+                options={"num_predict": self._max_tokens},
+            )
+        self._prompt_tokens += getattr(response, "prompt_eval_count", 0) or 0
+        self._completion_tokens += getattr(response, "eval_count", 0) or 0
+        raw = (response.message.content or "").strip()
+        try:
+            parsed = _json.loads(raw)
+        except _json.JSONDecodeError as exc:
+            raise ValueError(f"Model did not return valid JSON: {exc}\n\nRaw output: {raw[:500]}")
+        updated = messages + [{"role": "assistant", "content": raw}]
+        return parsed, updated
+
     def run_turn(
         self,
         messages: list[dict],

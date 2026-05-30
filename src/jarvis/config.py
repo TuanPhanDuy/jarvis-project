@@ -93,6 +93,7 @@ class Settings(BaseSettings):
     cors_allowed_origins: list[str] = Field(["*"], alias="JARVIS_CORS_ORIGINS")
     rate_limit_enabled: bool = Field(False, alias="JARVIS_RATE_LIMIT_ENABLED")
     chat_rate_limit: str = Field("30/minute", alias="JARVIS_CHAT_RATE_LIMIT")
+    rate_limit_per_user: bool = Field(False, alias="JARVIS_RATE_LIMIT_PER_USER")
 
     # WebSocket heartbeat
     ws_heartbeat_seconds: int = Field(30, alias="JARVIS_WS_HEARTBEAT")
