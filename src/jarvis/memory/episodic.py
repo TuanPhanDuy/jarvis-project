@@ -210,6 +210,67 @@ def handle_search_episodic_memory(tool_input: dict, db_path: Path, user_id: str 
         return f"ERROR: search_episodic_memory failed — {e}"
 
 
+def list_episodes(
+    db_path: Path,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict]:
+    """Return episodes newest-first with optional user/session filter."""
+    try:
+        conn = _get_conn(db_path)
+        try:
+            clauses, params = [], []
+            if user_id:
+                clauses.append("user_id = ?")
+                params.append(user_id)
+            if session_id:
+                clauses.append("session_id = ?")
+                params.append(session_id)
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            params += [limit, offset]
+            rows = conn.execute(
+                f"SELECT id, session_id, user_id, role, content, importance, timestamp "
+                f"FROM episodes {where} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def get_episode(db_path: Path, episode_id: int) -> dict | None:
+    """Return a single episode by ID."""
+    try:
+        conn = _get_conn(db_path)
+        try:
+            row = conn.execute(
+                "SELECT * FROM episodes WHERE id = ?", (episode_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def delete_episode(db_path: Path, episode_id: int) -> bool:
+    """Delete one episode by ID. Returns True if it existed."""
+    try:
+        conn = _get_conn(db_path)
+        try:
+            cur = conn.execute("DELETE FROM episodes WHERE id = ?", (episode_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        return cur.rowcount > 0
+    except Exception:
+        return False
+
+
 def search_episodes(
     db_path: Path,
     query: str,

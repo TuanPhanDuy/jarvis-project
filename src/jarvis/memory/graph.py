@@ -353,6 +353,95 @@ def delete_relationship(
         return False
 
 
+def list_entities(
+    db_path: Path,
+    user_id: str = "shared",
+    entity_type: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict]:
+    """Return entities with full metadata, newest first."""
+    try:
+        conn = _get_conn(db_path)
+        try:
+            where = "WHERE user_id IN (?, 'shared')"
+            params: list = [user_id]
+            if entity_type:
+                where += " AND type = ?"
+                params.append(entity_type)
+            params += [limit, offset]
+            rows = conn.execute(
+                f"SELECT name, type, description, user_id, created_at FROM entities "
+                f"{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+        finally:
+            conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def get_entity(db_path: Path, name: str, user_id: str = "shared") -> dict | None:
+    """Return a single entity with its outgoing relationships."""
+    try:
+        conn = _get_conn(db_path)
+        try:
+            row = conn.execute(
+                "SELECT name, type, description, user_id, created_at FROM entities "
+                "WHERE name = ? AND user_id IN (?, 'shared')",
+                (name, user_id),
+            ).fetchone()
+            if not row:
+                return None
+            rels = conn.execute(
+                "SELECT relation, to_entity, notes FROM relationships "
+                "WHERE from_entity = ? AND user_id IN (?, 'shared') ORDER BY created_at DESC",
+                (name, user_id),
+            ).fetchall()
+        finally:
+            conn.close()
+        return {
+            **dict(row),
+            "relationships": [dict(r) for r in rels],
+        }
+    except Exception:
+        return None
+
+
+def get_entity_neighbors(
+    db_path: Path,
+    name: str,
+    user_id: str = "shared",
+    depth: int = 1,
+) -> dict:
+    """Return a subgraph of neighbors up to `depth` hops from `name`.
+
+    Returns {nodes: [{name, type, description}], edges: [{from, relation, to}]}.
+    """
+    depth = max(1, min(depth, 3))  # cap at 3 to prevent huge queries
+    try:
+        conn = _get_conn(db_path)
+        try:
+            visited_names, rel_rows = _bfs_subgraph(conn, name, depth, relation_filter=None)
+            node_rows = conn.execute(
+                f"SELECT name, type, description FROM entities "
+                f"WHERE name IN ({','.join('?' * len(visited_names))}) "
+                f"AND user_id IN (?, 'shared')",
+                list(visited_names) + [user_id],
+            ).fetchall() if visited_names else []
+        finally:
+            conn.close()
+        return {
+            "nodes": [{"name": r["name"], "type": r["type"], "description": r["description"]}
+                      for r in node_rows],
+            "edges": [{"from": r["from_entity"], "relation": r["relation"], "to": r["to_entity"]}
+                      for r in rel_rows],
+        }
+    except Exception:
+        return {"nodes": [], "edges": []}
+
+
 def get_recent_entities(db_path: Path, user_id: str = "shared", limit: int = 20) -> list[str]:
     """Return the names of the most recently added entities in the knowledge graph."""
     try:

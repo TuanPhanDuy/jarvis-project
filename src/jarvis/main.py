@@ -166,6 +166,69 @@ def _run_voice(agent: PlannerAgent | ResearcherAgent, settings) -> None:
         print_usage_summary(agent.get_usage_summary())
 
 
+def _run_replay(session_id: str, settings, dry_run: bool = False) -> None:
+    from jarvis.agents.replay import replay_session
+    from jarvis.memory.sessions import load_sessions
+    db_path = settings.reports_dir / "jarvis.db"
+    rows = load_sessions(db_path, ttl_minutes=99999)
+    row = next((r for r in rows if r["session_id"] == session_id), None)
+    if not row:
+        print_error(f"Session '{session_id}' not found in persisted sessions.")
+        return
+    messages = row["messages"]
+    if not messages:
+        from rich import print as rprint
+        rprint("[yellow]Session has no messages to replay.[/yellow]")
+        return
+
+    if dry_run:
+        turns = replay_session(messages, run_turn_fn=lambda m: ("<stub>", m), dry_run=True)
+    else:
+        agent = _build_agent(settings)
+        turns = replay_session(messages, run_turn_fn=agent.run_turn)
+
+    from rich import print as rprint
+    from rich.table import Table
+    from rich.console import Console
+    console = Console()
+    table = Table(title=f"Replay: {session_id[:16]}…", show_lines=True)
+    table.add_column("#", width=3)
+    table.add_column("User message", max_width=40)
+    table.add_column("Original", max_width=50)
+    table.add_column("Replayed", max_width=50)
+    table.add_column("Changed", width=8)
+    for t in turns:
+        changed_str = "[red]YES[/red]" if t.changed else "[green]no[/green]"
+        table.add_row(
+            str(t.turn_index),
+            t.user_message[:80],
+            t.original_response[:200],
+            t.replayed_response[:200],
+            changed_str,
+        )
+    console.print(table)
+    changed = sum(1 for t in turns if t.changed)
+    rprint(f"\n[bold]{changed}/{len(turns)}[/bold] turns changed.")
+
+
+def _run_export_markdown(session_id: str, settings) -> None:
+    from jarvis.memory.sessions import load_sessions, get_metadata
+    from jarvis.tools.markdown_export import session_to_markdown
+    db_path = settings.reports_dir / "jarvis.db"
+    rows = load_sessions(db_path, ttl_minutes=99999)
+    row = next((r for r in rows if r["session_id"] == session_id), None)
+    if not row:
+        print_error(f"Session '{session_id}' not found.")
+        return
+    meta = get_metadata(db_path, session_id)
+    title = (meta or {}).get("title") or ""
+    md = session_to_markdown(row["messages"], session_id=session_id, title=title)
+    out_path = settings.reports_dir / f"session-{session_id[:8]}.md"
+    out_path.write_text(md, encoding="utf-8")
+    from rich import print as rprint
+    rprint(f"[green]Exported to {out_path}[/green]")
+
+
 def _run_one_shot(agent: ResearcherAgent, topic: str) -> None:
     messages = [{"role": "user", "content": f"Research this topic thoroughly: {topic}"}]
     with thinking_status(f"Researching: {topic}"):
@@ -181,6 +244,15 @@ def main() -> None:
     parser.add_argument("--voice", action="store_true", help="Enable voice mode")
     parser.add_argument("--researcher", action="store_true", help="Use ResearcherAgent directly")
     parser.add_argument("--ambient", action="store_true", help="Ambient wake-word voice loop")
+    parser.add_argument(
+        "--replay", metavar="SESSION_ID",
+        help="Replay a saved session and print per-turn diff (--dry-run for stub mode)",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Use stub responses during --replay")
+    parser.add_argument(
+        "--export-markdown", metavar="SESSION_ID",
+        help="Export a saved session as a Markdown file and exit",
+    )
     args = parser.parse_args()
 
     try:
@@ -188,6 +260,14 @@ def main() -> None:
     except Exception as e:
         print_error(f"Configuration error: {e}")
         sys.exit(1)
+
+    if args.replay:
+        _run_replay(args.replay, settings, dry_run=args.dry_run)
+        return
+
+    if args.export_markdown:
+        _run_export_markdown(args.export_markdown, settings)
+        return
 
     agent = _build_agent(settings, researcher_mode=args.researcher)
 

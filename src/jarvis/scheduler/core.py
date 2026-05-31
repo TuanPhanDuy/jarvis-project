@@ -548,6 +548,44 @@ def get_scheduler():
 
 # ── Job helpers ───────────────────────────────────────────────────────────────
 
+def _eval_run_job(
+    db_path_str: str,
+    reports_dir_str: str,
+    tags_json: str = "[]",
+    use_judge: bool = False,
+) -> None:
+    """Scheduled job: run eval suite, persist results, and fire a notification."""
+    import json as _json
+    import time as _time
+    try:
+        settings = get_settings()
+        db_path = Path(db_path_str)
+        reports_dir = Path(reports_dir_str)
+        tags = _json.loads(tags_json)
+
+        from jarvis.evals.suite import BASELINE_SUITE
+        from jarvis.evals.runner import run_suite, summarize
+        from jarvis.evals.trend import record_run
+
+        cases = [c for c in BASELINE_SUITE if (not tags or any(t in c.tags for t in tags))]
+        results = run_suite(cases=cases, settings=settings, use_judge=use_judge)
+        summary = summarize(results)
+        run_id = f"sched-{int(_time.time())}"
+        record_run(
+            db_path,
+            run_id=run_id,
+            total=summary["total"],
+            passed=summary["passed"],
+            failed=summary["failed"],
+            pass_rate=summary["pass_rate"],
+            tags=tags,
+            results=[vars(r) for r in results],
+        )
+        log.info("scheduled_eval_done", run_id=run_id, pass_rate=summary["pass_rate"])
+    except Exception as exc:
+        log.error("scheduled_eval_failed", error=str(exc))
+
+
 JOB_FUNCTIONS = {
     "research": _research_job,
     "monitor": _monitor_job,
@@ -562,5 +600,6 @@ JOB_FUNCTIONS = {
     "auto_crawl": _auto_crawl_job,
     "auto_finetune": _auto_finetune_job,
     "eval_check": _eval_check_job,
+    "eval_run": _eval_run_job,
     "prune_memory": _prune_memory_job,
 }

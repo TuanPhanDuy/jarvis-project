@@ -80,6 +80,66 @@ def prune_old_turns(db_path: Path, retention_days: int) -> int:
         return 0
 
 
+# USD per 1M tokens: {model_substring: (input_price, output_price)}
+_MODEL_PRICING: list[tuple[str, float, float]] = [
+    ("haiku",  0.80,  4.00),
+    ("sonnet",  3.00, 15.00),
+    ("opus",   15.00, 75.00),
+]
+
+
+def _cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    model_lower = model.lower()
+    for fragment, in_price, out_price in _MODEL_PRICING:
+        if fragment in model_lower:
+            return (input_tokens * in_price + output_tokens * out_price) / 1_000_000
+    return (input_tokens * 3.00 + output_tokens * 15.00) / 1_000_000
+
+
+def get_session_cost(db_path: Path, session_id: str) -> dict:
+    """Return per-turn cost breakdown and totals for a session."""
+    try:
+        conn = _get_conn(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT * FROM agent_turns WHERE session_id = ? ORDER BY timestamp ASC",
+                (session_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        turns = []
+        total_input = total_output = total_cost = 0.0
+        for i, r in enumerate(rows):
+            d = dict(r)
+            cost = _cost_usd(d["model"], d["input_tokens"], d["output_tokens"])
+            turns.append({
+                "turn_index": i,
+                "model": d["model"],
+                "agent_type": d["agent_type"],
+                "input_tokens": d["input_tokens"],
+                "output_tokens": d["output_tokens"],
+                "cost_usd": round(cost, 8),
+                "latency_ms": d["latency_ms"],
+                "timestamp": d["timestamp"],
+            })
+            total_input += d["input_tokens"]
+            total_output += d["output_tokens"]
+            total_cost += cost
+        return {
+            "session_id": session_id,
+            "turns": turns,
+            "totals": {
+                "turn_count": len(turns),
+                "input_tokens": int(total_input),
+                "output_tokens": int(total_output),
+                "total_tokens": int(total_input + total_output),
+                "cost_usd": round(total_cost, 8),
+            },
+        }
+    except Exception:
+        return {"session_id": session_id, "turns": [], "totals": {}}
+
+
 def get_turn_stats(
     db_path: Path,
     session_id: str | None = None,

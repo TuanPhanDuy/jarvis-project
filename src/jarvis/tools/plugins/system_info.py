@@ -11,7 +11,7 @@ def handle(tool_input: dict) -> str:
         sections: list[str] = []
 
         def _do_cpu():
-            pct = psutil.cpu_percent(interval=0.5)
+            pct = psutil.cpu_percent(interval=None)
             count = psutil.cpu_count()
             freq = psutil.cpu_freq()
             freq_str = f"{freq.current:.0f} MHz" if freq else "n/a"

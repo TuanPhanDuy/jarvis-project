@@ -124,3 +124,52 @@ class TestSseChat:
         done_events = [e for e in events if e.get("type") == "done"]
         assert len(done_events) == 1
         assert done_events[0]["session_id"]  # non-empty UUID
+
+
+class TestSseUsageEvent:
+    """Dedicated tests for the usage SSE event emitted before done."""
+
+    def _stream(self, client, sid: str, agent=None):
+        from jarvis.api.server import _sessions
+        _sessions[sid] = {
+            "agent": agent or _make_mock_agent(),
+            "messages": [],
+            "user_id": "anonymous",
+        }
+        with patch(_PATCH_BUDGET), patch(_PATCH_EPISODES), patch(_PATCH_SPEND):
+            return _parse_sse(client.post("/api/chat/stream",
+                                          json={"message": "hi", "session_id": sid}).text)
+
+    def test_usage_event_emitted(self, client):
+        events = self._stream(client, "usage-ev-1")
+        usage_events = [e for e in events if e.get("type") == "usage"]
+        assert len(usage_events) == 1
+
+    def test_usage_event_has_required_fields(self, client):
+        events = self._stream(client, "usage-ev-2")
+        ev = next(e for e in events if e.get("type") == "usage")
+        assert "input_tokens" in ev
+        assert "output_tokens" in ev
+        assert "cost_usd" in ev
+        assert "latency_ms" in ev
+
+    def test_usage_event_before_done(self, client):
+        events = self._stream(client, "usage-ev-3")
+        types = [e.get("type") for e in events]
+        usage_idx = types.index("usage")
+        done_idx = types.index("done")
+        assert usage_idx < done_idx
+
+    def test_usage_token_values_numeric(self, client):
+        agent = _make_mock_agent()
+        agent.get_usage_summary.return_value = {
+            "input_tokens": 42, "output_tokens": 17,
+            "cache_write_tokens": 0, "cache_read_tokens": 0,
+            "estimated_cost_usd": 0.001,
+        }
+        events = self._stream(client, "usage-ev-4", agent=agent)
+        ev = next(e for e in events if e.get("type") == "usage")
+        assert ev["input_tokens"] == 42
+        assert ev["output_tokens"] == 17
+        assert ev["cost_usd"] == 0.001
+        assert isinstance(ev["latency_ms"], float)

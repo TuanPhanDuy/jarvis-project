@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     # Agent turn timeout
     agent_turn_timeout_seconds: int = Field(120, alias="JARVIS_AGENT_TURN_TIMEOUT")
 
+    # Checkpoint every N turns (0 = disabled)
+    checkpoint_interval: int = Field(0, alias="JARVIS_CHECKPOINT_INTERVAL")
+
+    # Tool retry (0 = no retries)
+    tool_max_retries: int = Field(2, alias="JARVIS_TOOL_MAX_RETRIES")
+    tool_retry_base_delay: float = Field(1.0, alias="JARVIS_TOOL_RETRY_BASE_DELAY")
+
+    # Block messages with high-severity injection patterns
+    injection_block_high: bool = Field(False, alias="JARVIS_INJECTION_BLOCK_HIGH")
+
     # Proactive / event bus
     proactive_enabled: bool = Field(False, alias="JARVIS_PROACTIVE_ENABLED")
     idle_minutes: int = Field(30, alias="JARVIS_IDLE_MINUTES")

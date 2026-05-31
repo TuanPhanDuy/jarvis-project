@@ -56,7 +56,7 @@ class SystemMonitor:
         while True:
             await asyncio.sleep(self.INTERVAL)
             try:
-                cpu = psutil.cpu_percent(interval=1)
+                cpu = psutil.cpu_percent(interval=None)
                 mem = psutil.virtual_memory().percent
                 disk = psutil.disk_usage("/").percent  # percent used
 

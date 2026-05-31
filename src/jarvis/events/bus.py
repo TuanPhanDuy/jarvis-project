@@ -29,12 +29,29 @@ class EventBus:
     def __init__(self) -> None:
         self._queue: asyncio.Queue[JarvisEvent | None] = asyncio.Queue()
         self._handlers: dict[str, list[Handler]] = {}
+        # SSE fan-out: set of asyncio.Queues, one per connected SSE client
+        self._sse_listeners: set[asyncio.Queue] = set()
 
     def subscribe(self, event_type: str, handler: Handler) -> None:
         self._handlers.setdefault(event_type, []).append(handler)
 
+    def add_sse_listener(self) -> asyncio.Queue:
+        """Register a new SSE client queue. Returns the queue to read from."""
+        q: asyncio.Queue = asyncio.Queue(maxsize=100)
+        self._sse_listeners.add(q)
+        return q
+
+    def remove_sse_listener(self, q: asyncio.Queue) -> None:
+        """Unregister an SSE client queue."""
+        self._sse_listeners.discard(q)
+
     async def publish(self, event: JarvisEvent) -> None:
         await self._queue.put(event)
+        for q in list(self._sse_listeners):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass  # slow client — drop the event rather than block
 
     def publish_sync(self, event: JarvisEvent, loop: asyncio.AbstractEventLoop) -> None:
         """Thread-safe publish from synchronous code."""

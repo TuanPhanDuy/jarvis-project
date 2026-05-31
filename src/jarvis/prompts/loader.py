@@ -18,6 +18,9 @@ _PROMPTS_DIR = Path(__file__).parent
 def load_prompt(name: str, **variables: str) -> str:
     """Load a prompt template by name (without the .md extension).
 
+    Checks in-memory overrides first (see prompts/overrides.py); falls back
+    to the .md file if no override is registered.
+
     Args:
         name: Template filename without extension, e.g. "researcher".
         **variables: Optional substitutions for {placeholder} tokens in the template.
@@ -26,8 +29,16 @@ def load_prompt(name: str, **variables: str) -> str:
         The prompt string with variables substituted.
 
     Raises:
-        FileNotFoundError: If no template with that name exists.
+        FileNotFoundError: If no template with that name exists and no override is set.
     """
+    try:
+        from jarvis.prompts.overrides import get_override
+        override = get_override(name)
+        if override is not None:
+            return override.format_map(variables) if variables else override
+    except Exception:
+        pass
+
     path = _PROMPTS_DIR / f"{name}.md"
     if not path.exists():
         raise FileNotFoundError(f"Prompt template not found: {path}")

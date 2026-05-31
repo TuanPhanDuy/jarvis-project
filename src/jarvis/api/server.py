@@ -91,7 +91,7 @@ log = structlog.get_logger()
 # ── Session store ─────────────────────────────────────────────────────────────
 # Maps session_id → {"agent": agent, "messages": list[dict], "created_at": float}
 _sessions: dict[str, dict] = {}
-_executor = ThreadPoolExecutor(max_workers=20)
+_executor = ThreadPoolExecutor(max_workers=4)
 
 # Active WebSocket connections for proactive push: session_id → WebSocket
 _active_websockets: dict[str, "WebSocket"] = {}
@@ -173,6 +173,40 @@ class _RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+# ── Request access-log middleware ─────────────────────────────────────────────
+
+_ACCESS_LOG_SKIP = frozenset(["/api/events/stream", "/api/health", "/api/ready"])
+
+
+class _AccessLogMiddleware(BaseHTTPMiddleware):
+    """Records every non-streaming request to the SQLite access_log table."""
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in _ACCESS_LOG_SKIP:
+            return await call_next(request)
+        t0 = time.perf_counter()
+        response = await call_next(request)
+        latency_ms = (time.perf_counter() - t0) * 1000
+        try:
+            from jarvis.api.access_log import record_request
+            db_path = get_settings().reports_dir / "jarvis.db"
+            user_id = "anonymous"
+            auth = request.headers.get("authorization", "")
+            if auth.lower().startswith("bearer "):
+                try:
+                    from jarvis.auth.core import verify_token
+                    user = verify_token(auth[7:], get_settings().jwt_secret)
+                    if user:
+                        user_id = user.username
+                except Exception:
+                    pass
+            record_request(db_path, request.method, request.url.path,
+                           response.status_code, latency_ms, user_id)
+        except Exception:
+            pass
+        return response
+
+
 # ── App factory ───────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -249,6 +283,8 @@ app.add_middleware(
     enabled=_rl_enabled,
     per_user=_rl_per_user,
 )
+
+app.add_middleware(_AccessLogMiddleware)
 
 
 _require_auth = None  # set in lifespan; callable FastAPI dependency
@@ -624,6 +660,7 @@ async def chat(req: ChatRequest, _user=Depends(_auth_dep)) -> ChatResponse:
         raise HTTPException(status_code=402, detail=str(exc))
 
     _instrument_tool_dispatch(agent)
+    _check_injection(req.message, session_id, user_id, db_path)
 
     messages.append({"role": "user", "content": req.message})
     t0 = time.perf_counter()
@@ -661,12 +698,86 @@ async def chat(req: ChatRequest, _user=Depends(_auth_dep)) -> ChatResponse:
     _log_episodes(session_id, req.message, text_or_err, user_id=user_id)
     _record_spend(user_id, usage["estimated_cost_usd"])
     _persist_session(session_id, session)
+    _maybe_set_auto_title(session_id, updated_messages)
     log.info("chat_complete", session_id=session_id, duration_s=round(duration, 2))
     return ChatResponse(
         session_id=session_id,
         response=text_or_err,
         usage=UsageSummary(**usage),
     )
+
+
+# ── Batch chat ────────────────────────────────────────────────────────────────
+
+@app.post("/api/chat/batch", status_code=200)
+async def chat_batch(body: dict, _user=Depends(_auth_dep)) -> list[dict]:
+    """Run multiple chat turns concurrently and return all results.
+
+    Body:
+      requests      list of {session_id?, message, researcher_mode?}
+      max_concurrent int (default 4) — semaphore cap for parallel execution
+
+    Each result: {session_id, response, usage, error?}
+    Failed items include an "error" key; others include "response" and "usage".
+    """
+    from jarvis.api.budget import BudgetExceededError, check_budget
+
+    requests_list = body.get("requests") or []
+    if not requests_list:
+        raise HTTPException(status_code=422, detail="'requests' list is required")
+    max_concurrent = max(1, int(body.get("max_concurrent") or 4))
+    semaphore = asyncio.Semaphore(max_concurrent)
+    loop = asyncio.get_running_loop()
+    settings = get_settings()
+
+    async def _one(req_dict: dict) -> dict:
+        session_id = req_dict.get("session_id") or str(uuid.uuid4())
+        message = str(req_dict.get("message") or "")
+        if not message:
+            return {"session_id": session_id, "error": "message is required"}
+        researcher_mode = bool(req_dict.get("researcher_mode", False))
+        async with semaphore:
+            try:
+                session = _get_session(session_id, researcher_mode)
+                agent = session["agent"]
+                messages = session["messages"]
+                db_path = settings.reports_dir / "jarvis.db"
+                user_id = session.get("user_id") or "anonymous"
+                check_budget(db_path, user_id)
+                _instrument_tool_dispatch(agent)
+                _check_injection(message, session_id, user_id, db_path)
+                messages.append({"role": "user", "content": message})
+                result_holder: list = []
+
+                def _run():
+                    try:
+                        text, updated = agent.run_turn(messages)
+                        result_holder.append(("ok", text, updated))
+                    except Exception as exc:
+                        result_holder.append(("err", str(exc), messages))
+
+                await loop.run_in_executor(_executor, _run)
+                status, text_or_err, updated_messages = result_holder[0]
+                if status == "err":
+                    return {"session_id": session_id, "error": text_or_err}
+                session["messages"] = updated_messages
+                usage = agent.get_usage_summary()
+                _record_spend(user_id, usage["estimated_cost_usd"])
+                _persist_session(session_id, session)
+                _maybe_set_auto_title(session_id, updated_messages)
+                return {
+                    "session_id": session_id,
+                    "response": text_or_err,
+                    "usage": usage,
+                }
+            except BudgetExceededError as exc:
+                return {"session_id": session_id, "error": str(exc)}
+            except HTTPException as exc:
+                return {"session_id": session_id, "error": exc.detail}
+            except Exception as exc:
+                return {"session_id": session_id, "error": str(exc)}
+
+    return await asyncio.gather(*[_one(r) for r in requests_list])
 
 
 # ── SSE streaming chat ────────────────────────────────────────────────────────
@@ -676,8 +787,9 @@ async def chat_stream(req: ChatRequest, _user=Depends(_auth_dep)) -> StreamingRe
     """Streaming chat via Server-Sent Events.
 
     Emits a stream of JSON-encoded SSE events:
-      data: {"type":"chunk","text":"..."}   — partial response text
-      data: {"type":"tool","name":"..."}    — tool invocation notification
+      data: {"type":"chunk","text":"..."}    — partial response text
+      data: {"type":"tool","name":"..."}     — tool invocation notification
+      data: {"type":"usage","input_tokens":N,"output_tokens":N,"cost_usd":N,"latency_ms":N}
       data: {"type":"done","session_id":"...","usage":{...}}
       data: {"type":"error","message":"..."}
     """
@@ -709,6 +821,7 @@ async def chat_stream(req: ChatRequest, _user=Depends(_auth_dep)) -> StreamingRe
         loop.call_soon_threadsafe(queue.put_nowait, ("tool", name))
 
     _instrument_tool_dispatch(agent, on_tool_event=_on_tool)
+    _check_injection(req.message, session_id, user_id, db_path)
     messages.append({"role": "user", "content": req.message})
 
     def _run_agent():
@@ -719,6 +832,7 @@ async def chat_stream(req: ChatRequest, _user=Depends(_auth_dep)) -> StreamingRe
             loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
 
     _timeout = get_settings().agent_turn_timeout_seconds
+    t0 = time.perf_counter()
     future = loop.run_in_executor(_executor, _run_agent)
 
     async def _event_gen():
@@ -743,7 +857,10 @@ async def chat_stream(req: ChatRequest, _user=Depends(_auth_dep)) -> StreamingRe
                     _log_episodes(session_id, req.message, text, user_id=user_id)
                     _record_spend(user_id, usage["estimated_cost_usd"])
                     _persist_session(session_id, session)
+                    _maybe_set_auto_title(session_id, updated_messages)
                     REQUESTS_TOTAL.labels(mode="sse").inc()
+                    latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+                    yield f"data: {_json.dumps({'type': 'usage', 'input_tokens': usage['input_tokens'], 'output_tokens': usage['output_tokens'], 'cost_usd': usage['estimated_cost_usd'], 'latency_ms': latency_ms})}\n\n"
                     yield f"data: {_json.dumps({'type': 'done', 'session_id': session_id, 'usage': usage})}\n\n"
                     return
                 elif kind == "error":
@@ -1037,6 +1154,40 @@ def _record_spend(user_id: str, cost_usd: float) -> None:
         pass
 
 
+def _maybe_set_auto_title(session_id: str, messages: list[dict]) -> None:
+    """Set an auto-generated title on first exchange if none exists. Best-effort."""
+    try:
+        from jarvis.memory.sessions import generate_title, get_metadata, set_title
+        db_path = get_settings().reports_dir / "jarvis.db"
+        meta = get_metadata(db_path, session_id)
+        if meta and not meta.get("title"):
+            title = generate_title(messages)
+            set_title(db_path, session_id, title)
+    except Exception:
+        pass
+
+
+def _check_injection(message: str, session_id: str, user_id: str, db_path: Path) -> None:
+    """Scan message for prompt injection; log and optionally block. Best-effort."""
+    try:
+        from jarvis.security.injection import log_detection, max_severity, scan
+        findings = scan(message)
+        if not findings:
+            return
+        severity = max_severity(findings)
+        blocked = severity == "high" and get_settings().injection_block_high
+        log_detection(db_path, session_id, user_id, findings, blocked, snippet=message[:200])
+        if blocked:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Message blocked: prompt injection detected ({findings[0]['label']})",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+
 # ── Feedback endpoints ────────────────────────────────────────────────────────
 
 @app.post("/api/feedback", status_code=201)
@@ -1069,6 +1220,49 @@ async def list_feedback(
     from jarvis.memory.feedback import get_feedback_list
     db_path = get_settings().reports_dir / "jarvis.db"
     return get_feedback_list(db_path, limit=limit, offset=offset, session_id=session_id, user_id=user_id)
+
+
+# ── Tool quota endpoints ──────────────────────────────────────────────────────
+
+@app.get("/api/quotas/{user_id}")
+async def get_user_quotas(user_id: str, _user=Depends(_auth_dep)) -> list[dict]:
+    """Return all tool quotas for a user, including current usage in the window."""
+    from jarvis.tools.quotas import get_quotas
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_quotas(db_path, user_id)
+
+
+@app.put("/api/quotas/{user_id}/{tool_name}", status_code=200)
+async def set_user_tool_quota(
+    user_id: str,
+    tool_name: str,
+    body: dict,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Set a tool call quota for a user. Body: {limit: int, window_seconds: int}"""
+    from jarvis.tools.quotas import set_quota
+    limit = int(body.get("limit") or 0)
+    window = int(body.get("window_seconds") or 0)
+    if limit <= 0 or window <= 0:
+        raise HTTPException(status_code=422, detail="'limit' and 'window_seconds' must be positive integers")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    set_quota(db_path, user_id, tool_name, limit, window)
+    return {"user_id": user_id, "tool_name": tool_name, "limit": limit, "window_seconds": window}
+
+
+@app.delete("/api/quotas/{user_id}/{tool_name}", status_code=200)
+async def delete_user_tool_quota(
+    user_id: str,
+    tool_name: str,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Remove a tool call quota for a user."""
+    from jarvis.tools.quotas import delete_quota
+    db_path = get_settings().reports_dir / "jarvis.db"
+    removed = delete_quota(db_path, user_id, tool_name)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"No quota found for user '{user_id}', tool '{tool_name}'")
+    return {"user_id": user_id, "tool_name": tool_name, "deleted": True}
 
 
 # ── Budget endpoints ───────────────────────────────────────────────────────────
@@ -1352,6 +1546,98 @@ async def get_failure_patterns_endpoint(
     return get_failure_patterns(db_path, tool_name=tool_name, limit=limit)
 
 
+@app.get("/api/stats")
+async def system_stats(_user=Depends(_auth_dep)) -> dict:
+    """Return a comprehensive system snapshot.
+
+    Includes: session counts, total tokens & estimated cost, top tools,
+    memory sizes (episodes, graph entities, preferences), job statuses, DB size.
+    """
+    from jarvis.api.stats import get_system_stats
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_system_stats(db_path, sessions_active=len(_sessions))
+
+
+# ── API access log ───────────────────────────────────────────────────────────
+
+@app.get("/api/access-log")
+async def get_access_log_endpoint(
+    path: str | None = None,
+    status: int | None = None,
+    since_ts: float | None = None,
+    limit: int = 100,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return recent API access-log entries, newest first.
+
+    Filter by ?path= (substring), ?status= (exact HTTP status), ?since_ts= (Unix timestamp).
+    """
+    from jarvis.api.access_log import get_access_log
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_access_log(db_path, path_filter=path, status_filter=status,
+                          since_ts=since_ts, limit=min(limit, 500))
+
+
+@app.get("/api/access-log/stats")
+async def get_access_log_stats(
+    since_ts: float | None = None,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Return aggregated API access stats: top paths, error rate, avg latency."""
+    from jarvis.api.access_log import get_access_log_stats
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_access_log_stats(db_path, since_ts=since_ts)
+
+
+# ── Database maintenance ──────────────────────────────────────────────────────
+
+@app.get("/api/maintenance/stats")
+async def maintenance_db_stats(_user=Depends(_auth_dep)) -> dict:
+    """Return table row counts and DB file size."""
+    from jarvis.api.maintenance import get_db_stats
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_db_stats(db_path)
+
+
+@app.post("/api/maintenance/vacuum", status_code=200)
+async def maintenance_vacuum(_user=Depends(_auth_dep)) -> dict:
+    """Run SQLite VACUUM to reclaim disk space. Returns size_before, size_after, reclaimed_bytes."""
+    from jarvis.api.maintenance import vacuum_db
+    db_path = get_settings().reports_dir / "jarvis.db"
+    loop = asyncio.get_running_loop()
+    result_holder: list = []
+    await loop.run_in_executor(_executor, lambda: result_holder.append(vacuum_db(db_path)))
+    return result_holder[0] if result_holder else {}
+
+
+@app.post("/api/maintenance/prune", status_code=200)
+async def maintenance_prune(body: dict, _user=Depends(_auth_dep)) -> dict:
+    """Delete old records from specified tables.
+
+    Body:
+      target         (str) — "turns"|"episodes"|"audit"|"checkpoints"|"jobs"|"all"
+      older_than_days (int) — delete records older than this many days
+
+    Returns {deleted_counts: {table: N}}.
+    """
+    from jarvis.api.maintenance import prune_data
+    target = str(body.get("target") or "all").lower()
+    valid_targets = {"turns", "episodes", "audit", "checkpoints", "jobs", "all"}
+    if target not in valid_targets:
+        raise HTTPException(status_code=422, detail=f"'target' must be one of {sorted(valid_targets)}")
+    older_than_days = int(body.get("older_than_days") or 0)
+    if older_than_days <= 0:
+        raise HTTPException(status_code=422, detail="'older_than_days' must be a positive integer")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    loop = asyncio.get_running_loop()
+    result_holder: list = []
+    await loop.run_in_executor(
+        _executor,
+        lambda: result_holder.append(prune_data(db_path, target, older_than_days)),
+    )
+    return result_holder[0] if result_holder else {}
+
+
 @app.get("/api/analytics/agents")
 async def get_agent_analytics(
     agent_type: str | None = None,
@@ -1426,6 +1712,58 @@ async def delete_user_preference(
     deleted = delete_preference(db_path, user_id, category, key)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Preference '{category}/{key}' not found for user '{user_id}'.")
+
+
+# ── Knowledge graph entity browser ───────────────────────────────────────────
+
+@app.get("/api/knowledge-graph/entities")
+async def list_kg_entities(
+    user_id: str = "shared",
+    entity_type: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """List knowledge graph entities with metadata, newest first.
+
+    Optionally filter by entity_type (e.g. "concept", "person", "tool").
+    """
+    from jarvis.memory.graph import list_entities
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return list_entities(db_path, user_id=user_id, entity_type=entity_type,
+                         limit=limit, offset=offset)
+
+
+@app.get("/api/knowledge-graph/entities/{name}")
+async def get_kg_entity(
+    name: str,
+    user_id: str = "shared",
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Return a single entity with its outgoing relationships."""
+    from jarvis.memory.graph import get_entity
+    db_path = get_settings().reports_dir / "jarvis.db"
+    entity = get_entity(db_path, name, user_id=user_id)
+    if not entity:
+        raise HTTPException(status_code=404, detail=f"Entity '{name}' not found")
+    return entity
+
+
+@app.get("/api/knowledge-graph/entities/{name}/neighbors")
+async def get_kg_entity_neighbors(
+    name: str,
+    user_id: str = "shared",
+    depth: int = 1,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Return a BFS subgraph of neighbors up to `depth` hops from entity `name`.
+
+    Returns {nodes: [{name, type, description}], edges: [{from, relation, to}]}.
+    depth is capped at 3.
+    """
+    from jarvis.memory.graph import get_entity_neighbors
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_entity_neighbors(db_path, name, user_id=user_id, depth=depth)
 
 
 # ── Knowledge graph export ───────────────────────────────────────────────────
@@ -1575,6 +1913,227 @@ async def delete_session(session_id: str, _user=Depends(_auth_dep)) -> None:
     log.info("session_deleted", session_id=session_id)
 
 
+# ── Cross-session context injection ──────────────────────────────────────────
+
+@app.post("/api/sessions/{session_id}/inject-context", status_code=200)
+async def inject_context(
+    session_id: str,
+    body: dict,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Prepend context from other sessions into this session's message history.
+
+    Body:
+      sources        list of {session_id: str, max_chars?: int (default 2000)}
+      label?         str — heading for the injected block (default: "Injected context")
+
+    Returns: {injected_chars, source_count, session_id}
+
+    The context is injected as a system message at the front of the target
+    session's messages so it is available on the next agent turn.
+    """
+    from jarvis.agents.context_inject import build_context_block, inject_into_messages
+    from jarvis.memory.sessions import load_sessions
+
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+
+    sources_spec = body.get("sources") or []
+    if not sources_spec:
+        raise HTTPException(status_code=422, detail="'sources' list is required")
+
+    label = str(body.get("label") or "Injected context from prior sessions")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    all_sessions = {r["session_id"]: r for r in load_sessions(db_path, ttl_minutes=99999)}
+
+    sources: list[tuple[str, list[dict]]] = []
+    for spec in sources_spec:
+        src_id = str(spec.get("session_id") or "")
+        if not src_id:
+            continue
+        max_chars = int(spec.get("max_chars") or 2000)
+        # Check in-memory sessions first, then persisted
+        if src_id in _sessions:
+            msgs = list(_sessions[src_id].get("messages", []))
+        elif src_id in all_sessions:
+            msgs = all_sessions[src_id]["messages"]
+        else:
+            continue
+        sources.append((src_id, msgs))
+
+    if not sources:
+        raise HTTPException(status_code=422, detail="No valid source sessions found")
+
+    result = build_context_block(sources, label=label)
+    if result.injected_chars == 0:
+        return {"injected_chars": 0, "source_count": 0, "session_id": session_id}
+
+    _sessions[session_id]["messages"] = inject_into_messages(
+        _sessions[session_id].get("messages", []),
+        result.context_block,
+    )
+    return {
+        "injected_chars": result.injected_chars,
+        "source_count": result.source_count,
+        "session_id": session_id,
+    }
+
+
+# ── Session notes ────────────────────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/notes")
+async def get_session_notes(session_id: str, _user=Depends(_auth_dep)) -> list[dict]:
+    """Return all notes for a session, oldest first."""
+    from jarvis.memory.notes import list_notes
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return list_notes(db_path, session_id)
+
+
+@app.post("/api/sessions/{session_id}/notes", status_code=201)
+async def add_session_note(
+    session_id: str,
+    body: dict,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Add a free-text note to a session. Body: {content: str, author?: str}"""
+    from jarvis.memory.notes import add_note
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="'content' is required")
+    author = str(body.get("author") or "user")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return add_note(db_path, session_id, content, author=author)
+
+
+@app.delete("/api/sessions/{session_id}/notes/{note_id}", status_code=200)
+async def delete_session_note(
+    session_id: str,
+    note_id: str,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Delete a session note by ID."""
+    from jarvis.memory.notes import delete_note
+    db_path = get_settings().reports_dir / "jarvis.db"
+    removed = delete_note(db_path, note_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Note '{note_id}' not found")
+    return {"note_id": note_id, "deleted": True}
+
+
+# ── Session metadata and title ────────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/metadata")
+async def get_session_metadata(session_id: str, _user=Depends(_auth_dep)) -> dict:
+    """Return metadata (title, tags, agent_type, timestamps) for a session.
+
+    Does not include the full message history.
+    """
+    from jarvis.memory.sessions import get_metadata
+    db_path = get_settings().reports_dir / "jarvis.db"
+    meta = get_metadata(db_path, session_id)
+    if not meta:
+        # Fall back to in-memory session
+        session = _sessions.get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+        agent = session.get("agent")
+        return {
+            "session_id": session_id,
+            "agent_type": type(agent).__name__ if agent else "Unknown",
+            "user_id": session.get("user_id"),
+            "fork_of": session.get("fork_of"),
+            "title": session.get("title"),
+            "tags": [],
+            "created_at": None,
+            "updated_at": None,
+        }
+    return meta
+
+
+@app.patch("/api/sessions/{session_id}/title", status_code=200)
+async def update_session_title(
+    session_id: str,
+    body: dict,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Manually set the title for a session. Body: {title: str}"""
+    from jarvis.memory.sessions import set_title
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="'title' is required")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    ok = set_title(db_path, session_id, title)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    # Also update in-memory session if active
+    if session_id in _sessions:
+        _sessions[session_id]["title"] = title
+    return {"session_id": session_id, "title": title}
+
+
+# ── Session tags ──────────────────────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/tags")
+async def get_session_tags(session_id: str, _user=Depends(_auth_dep)) -> list[str]:
+    """Return all tags for a session."""
+    from jarvis.memory.sessions import get_tags
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_tags(db_path, session_id)
+
+
+@app.post("/api/sessions/{session_id}/tags", status_code=201)
+async def add_session_tag(
+    session_id: str,
+    body: dict,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Add a tag to a session. Body: {tag: str}"""
+    from jarvis.memory.sessions import add_tag
+    tag = (body.get("tag") or "").strip().lower()
+    if not tag:
+        raise HTTPException(status_code=422, detail="'tag' is required")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    ok = add_tag(db_path, session_id, tag)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    return {"session_id": session_id, "tag": tag}
+
+
+@app.delete("/api/sessions/{session_id}/tags/{tag}", status_code=200)
+async def remove_session_tag(
+    session_id: str,
+    tag: str,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Remove a tag from a session."""
+    from jarvis.memory.sessions import remove_tag
+    db_path = get_settings().reports_dir / "jarvis.db"
+    removed = remove_tag(db_path, session_id, tag.lower())
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Tag '{tag}' not found on session")
+    return {"session_id": session_id, "tag": tag.lower(), "removed": True}
+
+
+# ── Session full-text search ───────────────────────────────────────────────────
+
+@app.get("/api/sessions/search")
+async def search_sessions_endpoint(
+    q: str,
+    tag: str | None = None,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Full-text search across persisted session message content.
+
+    Returns [{session_id, snippet, rank}] ordered by relevance.
+    Optionally filter to sessions with a given tag.
+    """
+    if not q.strip():
+        raise HTTPException(status_code=422, detail="'q' query parameter is required")
+    from jarvis.memory.sessions import search_sessions
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return search_sessions(db_path, q, tag=tag)
+
+
 # ── Plan history endpoints ────────────────────────────────────────────────────
 
 @app.get("/api/plans")
@@ -1718,34 +2277,65 @@ async def get_config(_user=Depends(_auth_dep)) -> dict:
 
 @app.get("/api/memory/episodes")
 async def get_memory_episodes(
+    user_id: str | None = None,
     session_id: str | None = None,
-    limit: int = 20,
+    limit: int = 50,
     offset: int = 0,
     _user=Depends(_auth_dep),
 ) -> list[dict]:
-    """Return paginated episodic memory entries."""
-    from jarvis.memory.episodic import _get_conn
+    """Return paginated episodic memory entries, newest first.
+
+    Filter by ?user_id= and/or ?session_id=. Includes importance score.
+    """
+    from jarvis.memory.episodic import list_episodes
     db_path = get_settings().reports_dir / "jarvis.db"
-    try:
-        conn = _get_conn(db_path)
-        try:
-            if session_id:
-                rows = conn.execute(
-                    "SELECT session_id, user_id, role, content, timestamp FROM episodes "
-                    "WHERE session_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                    (session_id, limit, offset),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT session_id, user_id, role, content, timestamp FROM episodes "
-                    "ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                    (limit, offset),
-                ).fetchall()
-        finally:
-            conn.close()
-        return [dict(r) for r in rows]
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    return list_episodes(db_path, user_id=user_id, session_id=session_id,
+                         limit=min(limit, 200), offset=offset)
+
+
+@app.get("/api/memory/episodes/{episode_id}")
+async def get_memory_episode(episode_id: int, _user=Depends(_auth_dep)) -> dict:
+    """Return a single episodic memory entry by ID."""
+    from jarvis.memory.episodic import get_episode
+    db_path = get_settings().reports_dir / "jarvis.db"
+    ep = get_episode(db_path, episode_id)
+    if not ep:
+        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
+    return ep
+
+
+@app.post("/api/memory/episodes/{episode_id}/boost", status_code=200)
+async def boost_episode_importance(
+    episode_id: int,
+    body: dict = {},
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Manually boost the importance of an episodic memory entry.
+
+    Body (optional): {delta: float (default 0.2)}
+    Higher importance = surfaced more often in proactive memory injection.
+    """
+    from jarvis.memory.episodic import boost_importance, get_episode
+    delta = float(body.get("delta") or 0.2)
+    if delta <= 0:
+        raise HTTPException(status_code=422, detail="'delta' must be positive")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    boost_importance(db_path, episode_id, delta)
+    ep = get_episode(db_path, episode_id)
+    if not ep:
+        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
+    return ep
+
+
+@app.delete("/api/memory/episodes/{episode_id}", status_code=200)
+async def delete_episode_endpoint(episode_id: int, _user=Depends(_auth_dep)) -> dict:
+    """Delete a single episodic memory entry."""
+    from jarvis.memory.episodic import delete_episode
+    db_path = get_settings().reports_dir / "jarvis.db"
+    removed = delete_episode(db_path, episode_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Episode {episode_id} not found")
+    return {"episode_id": episode_id, "deleted": True}
 
 
 @app.get("/api/memory/graph")
@@ -1830,6 +2420,58 @@ async def get_session_summaries(
     from jarvis.memory.preferences import get_session_summaries_full
     db_path = get_settings().reports_dir / "jarvis.db"
     return get_session_summaries_full(db_path, user_id, limit=limit)
+
+
+@app.post("/api/knowledge-graph/deduplicate", status_code=200)
+async def deduplicate_knowledge_graph(
+    body: dict = {},
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Run an entity deduplication pass on the knowledge graph.
+
+    Body (optional):
+      user_id             (str, default "shared")
+      similarity_threshold (float, default 0.85) — Jaccard similarity cutoff
+      dry_run             (bool, default false) — find pairs but do not merge
+
+    Returns: {pairs_found, merged_count, duration_ms, pairs (only when dry_run=true)}
+    """
+    from jarvis.memory.graph_dedup import find_duplicate_pairs, deduplicate_entities
+
+    user_id = str(body.get("user_id") or "shared")
+    threshold = float(body.get("similarity_threshold") or 0.85)
+    dry_run = bool(body.get("dry_run", False))
+    db_path = get_settings().reports_dir / "jarvis.db"
+
+    loop = asyncio.get_running_loop()
+    result_holder: list = []
+
+    def _run():
+        t0 = time.perf_counter()
+        pairs = find_duplicate_pairs(db_path, user_id=user_id, similarity_threshold=threshold)
+        if dry_run:
+            duration_ms = round((time.perf_counter() - t0) * 1000, 1)
+            result_holder.append({
+                "pairs_found": len(pairs),
+                "merged_count": 0,
+                "duration_ms": duration_ms,
+                "pairs": [{"entity_a": a, "entity_b": b} for a, b in pairs],
+            })
+        else:
+            from jarvis.memory.graph_dedup import merge_entities
+            merged = 0
+            for canonical, duplicate in pairs:
+                if merge_entities(db_path, canonical, duplicate, user_id) >= 0:
+                    merged += 1
+            duration_ms = round((time.perf_counter() - t0) * 1000, 1)
+            result_holder.append({
+                "pairs_found": len(pairs),
+                "merged_count": merged,
+                "duration_ms": duration_ms,
+            })
+
+    await loop.run_in_executor(_executor, _run)
+    return result_holder[0] if result_holder else {}
 
 
 @app.delete("/api/knowledge-graph/entities/{name}", status_code=204)
@@ -2335,6 +2977,57 @@ async def memory_search(
     return result
 
 
+# ── Per-tool configuration ────────────────────────────────────────────────────
+
+@app.get("/api/tools/{tool_name}/config")
+async def get_tool_config_endpoint(tool_name: str, _user=Depends(_auth_dep)) -> dict:
+    """Return the per-tool runtime configuration (timeout, retries, cache TTL).
+
+    Fields with null values use the global setting / default.
+    """
+    from jarvis.tools.tool_config import get_tool_config
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_tool_config(db_path, tool_name)
+
+
+@app.put("/api/tools/{tool_name}/config", status_code=200)
+async def set_tool_config_endpoint(
+    tool_name: str,
+    body: dict,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Set per-tool runtime overrides.
+
+    Body (all optional):
+      timeout_seconds   (int) — tool-level timeout, overrides global
+      max_retries       (int) — retry count, overrides global
+      cache_ttl_seconds (int) — cache entry lifetime for this tool
+    """
+    from jarvis.tools.tool_config import set_tool_config, get_tool_config
+    timeout = body.get("timeout_seconds")
+    retries = body.get("max_retries")
+    cache_ttl = body.get("cache_ttl_seconds")
+    if timeout is None and retries is None and cache_ttl is None:
+        raise HTTPException(status_code=422, detail="At least one field is required")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    set_tool_config(db_path, tool_name,
+                    timeout_seconds=int(timeout) if timeout is not None else None,
+                    max_retries=int(retries) if retries is not None else None,
+                    cache_ttl_seconds=int(cache_ttl) if cache_ttl is not None else None)
+    return get_tool_config(db_path, tool_name)
+
+
+@app.delete("/api/tools/{tool_name}/config", status_code=200)
+async def delete_tool_config_endpoint(tool_name: str, _user=Depends(_auth_dep)) -> dict:
+    """Remove per-tool overrides, reverting this tool to global defaults."""
+    from jarvis.tools.tool_config import delete_tool_config
+    db_path = get_settings().reports_dir / "jarvis.db"
+    removed = delete_tool_config(db_path, tool_name)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"No config override for tool '{tool_name}'")
+    return {"tool_name": tool_name, "reset": True}
+
+
 # ── Tool registry introspection ───────────────────────────────────────────────
 
 @app.get("/api/tools")
@@ -2416,6 +3109,85 @@ async def get_tool_detail(tool_name: str, _user=Depends(_auth_dep)) -> dict:
     return schema
 
 
+# ── Eval scheduling ──────────────────────────────────────────────────────────
+
+@app.post("/api/evals/schedule", status_code=201)
+async def schedule_eval_run(body: dict, _user=Depends(_auth_dep)) -> dict:
+    """Schedule a recurring eval suite run via cron.
+
+    Body:
+      cron     (str, required) — 5-field cron expression (minute hour day month weekday, UTC)
+      tags     (list[str])     — only run cases with these tags; empty = all cases
+      judge    (bool)          — enable Claude-as-judge scoring (default false)
+
+    Returns {job_id, cron, message}.
+    """
+    from apscheduler.triggers.cron import CronTrigger
+    from jarvis.scheduler.core import JOB_FUNCTIONS, get_scheduler
+    import json as _json
+
+    scheduler = get_scheduler()
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="Scheduler not running")
+
+    cron = (body.get("cron") or "").strip()
+    parts = cron.split()
+    if len(parts) != 5:
+        raise HTTPException(status_code=422, detail="cron must have 5 fields: minute hour day month weekday")
+
+    tags = body.get("tags") or []
+    use_judge = bool(body.get("judge", False))
+    settings = get_settings()
+
+    minute, hour, day, month, dow = parts
+    trigger = CronTrigger(minute=minute, hour=hour, day=day, month=month,
+                          day_of_week=dow, timezone="UTC")
+    job_id = f"eval-{str(uuid.uuid4())[:8]}"
+    scheduler.add_job(
+        JOB_FUNCTIONS["eval_run"],
+        trigger,
+        kwargs={
+            "db_path_str": str(settings.reports_dir / "jarvis.db"),
+            "reports_dir_str": str(settings.reports_dir),
+            "tags_json": _json.dumps(tags),
+            "use_judge": use_judge,
+        },
+        id=job_id,
+        replace_existing=True,
+    )
+    return {"job_id": job_id, "cron": cron, "tags": tags, "judge": use_judge,
+            "message": f"Eval run scheduled (cron: {cron} UTC)"}
+
+
+@app.get("/api/evals/schedule")
+async def list_eval_schedules(_user=Depends(_auth_dep)) -> list[dict]:
+    """List all scheduled eval run jobs."""
+    from jarvis.scheduler.core import get_scheduler
+    scheduler = get_scheduler()
+    if scheduler is None:
+        return []
+    jobs = []
+    for job in scheduler.get_jobs():
+        if str(job.id).startswith("eval-"):
+            next_run = job.next_run_time.isoformat() if job.next_run_time else None
+            jobs.append({"job_id": job.id, "next_run": next_run, "func": job.func.__name__})
+    return jobs
+
+
+@app.delete("/api/evals/schedule/{job_id}", status_code=200)
+async def delete_eval_schedule(job_id: str, _user=Depends(_auth_dep)) -> dict:
+    """Remove a scheduled eval run job."""
+    from jarvis.scheduler.core import get_scheduler
+    scheduler = get_scheduler()
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="Scheduler not running")
+    try:
+        scheduler.remove_job(job_id)
+        return {"job_id": job_id, "deleted": True}
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Scheduled eval job '{job_id}' not found")
+
+
 # ── Eval trend ────────────────────────────────────────────────────────────────
 
 @app.get("/api/evals/trend")
@@ -2435,6 +3207,32 @@ async def get_eval_run(run_id: str, _user=Depends(_auth_dep)) -> dict:
     if not record:
         raise HTTPException(status_code=404, detail=f"Eval run '{run_id}' not found")
     return record
+
+
+@app.get("/api/evals/compare")
+async def compare_eval_runs(
+    run_a: str,
+    run_b: str,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Compare two eval runs side-by-side.
+
+    Returns {run_a, run_b, delta_pass_rate, improved, regressed,
+             unchanged_pass, unchanged_fail}.
+
+    improved  — case_ids that failed in run_a but passed in run_b
+    regressed — case_ids that passed in run_a but failed in run_b
+    delta_pass_rate — run_b.pass_rate − run_a.pass_rate (positive = improvement)
+    """
+    from jarvis.evals.trend import compare_runs
+    db_path = get_settings().reports_dir / "jarvis.db"
+    result = compare_runs(db_path, run_a, run_b)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"One or both eval runs not found: '{run_a}', '{run_b}'",
+        )
+    return result
 
 
 # ── Parallel map SSE ─────────────────────────────────────────────────────────
@@ -2655,6 +3453,20 @@ async def get_slow_tools(
     return get_slow_tools(db_path, threshold_ms=threshold_ms)
 
 
+@app.get("/api/security/injection-stats")
+async def injection_stats(
+    since_ts: float | None = None,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Return aggregated prompt-injection detection statistics.
+
+    Optionally filter to events after since_ts (Unix timestamp).
+    """
+    from jarvis.security.injection import get_stats
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_stats(db_path, since_ts=since_ts)
+
+
 # ── Session fork ──────────────────────────────────────────────────────────────
 
 @app.post("/api/sessions/{session_id}/fork", status_code=201)
@@ -2714,6 +3526,230 @@ async def fork_session(
         "message_count": len(messages),
         "forked_at": _sessions[new_sid]["forked_at"],
     }
+
+
+# ── Agent checkpoints ─────────────────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/checkpoints")
+async def list_checkpoints(
+    session_id: str,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """List all saved checkpoints for a session, oldest first."""
+    from jarvis.agents.checkpoint import list_checkpoints as _list_cp
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return _list_cp(db_path, session_id)
+
+
+@app.post("/api/sessions/{session_id}/checkpoints", status_code=201)
+async def create_checkpoint(
+    session_id: str,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Manually save a checkpoint for the current in-memory session state."""
+    from jarvis.agents.checkpoint import save_checkpoint
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    db_path = get_settings().reports_dir / "jarvis.db"
+    agent = session.get("agent")
+    turn_count = getattr(agent, "_turn_count", 0) if agent else 0
+    agent_type = type(agent).__name__ if agent else "Unknown"
+    messages = session.get("messages", [])
+    cp_id = save_checkpoint(db_path, session_id, turn_count, agent_type, messages)
+    return {"checkpoint_id": cp_id, "session_id": session_id, "turn_count": turn_count,
+            "message_count": len(messages)}
+
+
+@app.post("/api/sessions/{session_id}/checkpoints/{checkpoint_id}/restore", status_code=201)
+async def restore_checkpoint(
+    session_id: str,
+    checkpoint_id: str,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Fork a new session from a saved checkpoint, restoring that message state."""
+    from jarvis.agents.checkpoint import load_checkpoint
+    db_path = get_settings().reports_dir / "jarvis.db"
+    cp = load_checkpoint(db_path, checkpoint_id)
+    if cp is None or cp["session_id"] != session_id:
+        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
+    new_sid = str(uuid.uuid4())
+    _sessions[new_sid] = {
+        "messages": list(cp["messages"]),
+        "agent": None,
+        "user_id": None,
+        "fork_of": session_id,
+        "forked_at": time.time(),
+        "restored_from_checkpoint": checkpoint_id,
+    }
+    return {
+        "session_id": new_sid,
+        "fork_of": session_id,
+        "checkpoint_id": checkpoint_id,
+        "turn_count": cp["turn_count"],
+        "message_count": len(cp["messages"]),
+    }
+
+
+@app.delete("/api/sessions/{session_id}/checkpoints", status_code=200)
+async def delete_checkpoints(
+    session_id: str,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Delete all checkpoints for a session."""
+    from jarvis.agents.checkpoint import delete_checkpoints as _del_cp
+    db_path = get_settings().reports_dir / "jarvis.db"
+    deleted = _del_cp(db_path, session_id)
+    return {"deleted": deleted}
+
+
+# ── Agent capability registry ────────────────────────────────────────────────
+
+@app.get("/api/agents")
+async def list_agent_types(_user=Depends(_auth_dep)) -> list[dict]:
+    """List all known agent types with their capabilities.
+
+    Returns [{name, description, allowed_tools, tool_count, prompt_file, prompt_source}].
+    allowed_tools is null for agents that accept all tools (planner, team_agent).
+    """
+    from jarvis.agents.registry import list_agents
+    return list_agents()
+
+
+@app.get("/api/agents/{agent_name}")
+async def get_agent_type(agent_name: str, _user=Depends(_auth_dep)) -> dict:
+    """Return capability info for a specific agent type."""
+    from jarvis.agents.registry import get_agent_info
+    info = get_agent_info(agent_name)
+    if not info:
+        raise HTTPException(status_code=404, detail=f"Agent type '{agent_name}' not found")
+    return info
+
+
+# ── Prompt management ────────────────────────────────────────────────────────
+
+_KNOWN_AGENT_TYPES = frozenset([
+    "researcher", "planner", "coder", "qa", "critic", "data_analyst",
+    "devops", "team_agent", "backend", "frontend", "manager", "team_lead",
+])
+
+
+@app.get("/api/prompts")
+async def list_prompts(_user=Depends(_auth_dep)) -> list[dict]:
+    """List all agent prompts with their source (file or in-memory override).
+
+    Returns [{agent_type, source: "file"|"override", length_chars}].
+    """
+    from jarvis.prompts.overrides import list_overrides
+    from jarvis.prompts.loader import _PROMPTS_DIR
+    overrides = list_overrides()
+    result = []
+    for md_file in sorted(_PROMPTS_DIR.glob("*.md")):
+        name = md_file.stem
+        source = "override" if name in overrides else "file"
+        try:
+            from jarvis.prompts.loader import load_prompt
+            text = load_prompt(name)
+        except Exception:
+            text = ""
+        result.append({"agent_type": name, "source": source, "length_chars": len(text)})
+    # Also include overrides for types without a .md file
+    for name in overrides:
+        if not (_PROMPTS_DIR / f"{name}.md").exists():
+            result.append({"agent_type": name, "source": "override", "length_chars": len(overrides[name])})
+    return result
+
+
+@app.get("/api/prompts/{agent_type}")
+async def get_prompt(agent_type: str, _user=Depends(_auth_dep)) -> dict:
+    """Return the current effective prompt for an agent type.
+
+    Returns {agent_type, prompt, source: "file"|"override"}.
+    """
+    from jarvis.prompts.overrides import get_override
+    from jarvis.prompts.loader import load_prompt, _PROMPTS_DIR
+    override = get_override(agent_type)
+    source = "override" if override else "file"
+    try:
+        prompt = load_prompt(agent_type)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"No prompt found for '{agent_type}'")
+    return {"agent_type": agent_type, "prompt": prompt, "source": source}
+
+
+@app.put("/api/prompts/{agent_type}", status_code=200)
+async def set_prompt_override(
+    agent_type: str,
+    body: dict,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Set an in-memory prompt override for an agent type.
+
+    Body: {prompt: str}
+    The override is active immediately and persists until reset or server restart.
+    """
+    from jarvis.prompts.overrides import get_override, set_override
+    from jarvis.prompts.history import record_version
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=422, detail="'prompt' is required")
+    # Save the current value to history before overwriting
+    current = get_override(agent_type)
+    if current is None:
+        try:
+            from jarvis.prompts.loader import load_prompt
+            current = load_prompt(agent_type)
+        except Exception:
+            current = ""
+    if current:
+        record_version(get_settings().reports_dir / "jarvis.db", agent_type, current)
+    set_override(agent_type, prompt)
+    return {"agent_type": agent_type, "source": "override", "length_chars": len(prompt)}
+
+
+@app.delete("/api/prompts/{agent_type}", status_code=200)
+async def reset_prompt_override(agent_type: str, _user=Depends(_auth_dep)) -> dict:
+    """Remove the in-memory override for an agent type, reverting to the .md file."""
+    from jarvis.prompts.overrides import clear_override
+    existed = clear_override(agent_type)
+    if not existed:
+        raise HTTPException(status_code=404, detail=f"No override set for '{agent_type}'")
+    return {"agent_type": agent_type, "source": "file", "reset": True}
+
+
+@app.get("/api/prompts/{agent_type}/history")
+async def get_prompt_history(agent_type: str, _user=Depends(_auth_dep)) -> list[dict]:
+    """Return saved prompt versions for an agent type, newest first.
+
+    Does not include the full prompt text — use the rollback endpoint to
+    retrieve a specific version's content.
+    Returns [{version_id, agent_type, set_at, length_chars}].
+    """
+    from jarvis.prompts.history import get_history
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return get_history(db_path, agent_type)
+
+
+@app.post("/api/prompts/{agent_type}/rollback/{version_id}", status_code=200)
+async def rollback_prompt(
+    agent_type: str,
+    version_id: str,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Restore a saved prompt version as the current in-memory override."""
+    from jarvis.prompts.history import get_version, record_version
+    from jarvis.prompts.overrides import get_override, set_override
+    db_path = get_settings().reports_dir / "jarvis.db"
+    version = get_version(db_path, version_id)
+    if not version or version["agent_type"] != agent_type.lower():
+        raise HTTPException(status_code=404, detail=f"Version '{version_id}' not found for '{agent_type}'")
+    # Archive current before rolling back
+    current = get_override(agent_type)
+    if current:
+        record_version(db_path, agent_type, current)
+    set_override(agent_type, version["prompt"])
+    return {"agent_type": agent_type, "version_id": version_id,
+            "source": "override", "length_chars": len(version["prompt"])}
 
 
 # ── Config hot-reload ─────────────────────────────────────────────────────────
@@ -2784,6 +3820,59 @@ async def reload_config(_user=Depends(_auth_dep)) -> dict:
     return {"changed": changed, "reloaded_at": reloaded_at}
 
 
+# ── Live event bus SSE stream ─────────────────────────────────────────────────
+
+@app.get("/api/events/stream")
+async def event_stream(
+    filter: str | None = None,
+    _user=Depends(_auth_dep),
+) -> StreamingResponse:
+    """Stream all JARVIS event-bus events as Server-Sent Events.
+
+    Each event: data: {"event_type": "...", "event_id": "...", "timestamp": ..., ...}
+
+    Query params:
+      filter (str) — comma-separated list of event_type values to include.
+                     Omit to receive all events.
+
+    Connect with EventSource in the browser or `curl -N /api/events/stream`.
+    The connection stays open until the client disconnects.
+    """
+    import json as _json
+    from jarvis.events.bus import get_event_bus
+
+    allowed_types: set[str] | None = None
+    if filter:
+        allowed_types = {t.strip() for t in filter.split(",") if t.strip()}
+
+    bus = get_event_bus()
+    q = bus.add_sse_listener()
+
+    async def _gen():
+        try:
+            # Send a keep-alive comment immediately so the client knows it's connected
+            yield ": connected\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=30)
+                    if allowed_types and event.event_type not in allowed_types:
+                        continue
+                    payload = event.to_dict() if hasattr(event, "to_dict") else {"event_type": event.event_type}
+                    yield f"data: {_json.dumps(payload)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            bus.remove_sse_listener(q)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # ── Notification center ────────────────────────────────────────────────────────
 
 @app.get("/api/notifications")
@@ -2842,6 +3931,145 @@ async def create_notification(body: dict, _user=Depends(_auth_dep)) -> dict:
         body=body.get("body", ""),
         severity=body.get("severity", "info"),
     )
+
+
+# ── Async job queue ───────────────────────────────────────────────────────────
+
+@app.post("/api/jobs", status_code=202)
+async def enqueue_job(body: dict, _user=Depends(_auth_dep)) -> dict:
+    """Enqueue a background agent task. Returns immediately with a job ID.
+
+    Body: {message: str, agent_type?: str (planner|researcher|coder|...), user_id?: str}
+    Poll GET /api/jobs/{id} for status and result.
+    """
+    message = (body.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=422, detail="'message' is required")
+    agent_type = str(body.get("agent_type") or "planner").lower()
+    user_id = str(body.get("user_id") or (_user.username if hasattr(_user, "username") else "anonymous"))
+
+    from jarvis.api.jobs import create_job, mark_done, mark_failed, mark_running
+    db_path = get_settings().reports_dir / "jarvis.db"
+    job_id = create_job(db_path, message, agent_type=agent_type, user_id=user_id)
+
+    loop = asyncio.get_running_loop()
+
+    def _run_job():
+        mark_running(db_path, job_id)
+        try:
+            settings = get_settings()
+            session_id = f"job-{job_id[:8]}"
+            session = _get_session(session_id, researcher_mode=(agent_type == "researcher"))
+            agent = session["agent"]
+            messages = [{"role": "user", "content": message}]
+            result_text, _ = agent.run_turn(messages)
+            usage = agent.get_usage_summary()
+            _record_spend(user_id, usage["estimated_cost_usd"])
+            mark_done(db_path, job_id, result_text, usage)
+        except Exception as exc:
+            mark_failed(db_path, job_id, str(exc))
+
+    loop.run_in_executor(_executor, _run_job)
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str, _user=Depends(_auth_dep)) -> dict:
+    """Return status and result for a background job."""
+    from jarvis.api.jobs import get_job as _get_job
+    db_path = get_settings().reports_dir / "jarvis.db"
+    job = _get_job(db_path, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    return job
+
+
+@app.get("/api/jobs")
+async def list_jobs(
+    user_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """List recent background jobs, newest first."""
+    from jarvis.api.jobs import list_jobs as _list_jobs
+    db_path = get_settings().reports_dir / "jarvis.db"
+    return _list_jobs(db_path, user_id=user_id, status=status, limit=limit)
+
+
+@app.delete("/api/jobs/{job_id}", status_code=204)
+async def cancel_job(job_id: str, _user=Depends(_auth_dep)) -> None:
+    """Cancel a pending job (no-op if already running or done)."""
+    import sqlite3 as _sq
+    db_path = get_settings().reports_dir / "jarvis.db"
+    from jarvis.api.jobs import _conn as _jobs_conn
+    conn = _jobs_conn(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE agent_jobs SET status='cancelled', finished_at=? WHERE id=? AND status='pending'",
+            (time.time(), job_id),
+        )
+        conn.commit()
+        found = conn.execute("SELECT 1 FROM agent_jobs WHERE id=?", (job_id,)).fetchone()
+    finally:
+        conn.close()
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+
+# ── Agent debate ──────────────────────────────────────────────────────────────
+
+@app.post("/api/debate", status_code=200)
+async def run_debate_endpoint(body: dict, _user=Depends(_auth_dep)) -> dict:
+    """Run a researcher→critic debate on a question.
+
+    Body: {question: str, model?: str, max_tokens?: int}
+
+    Returns: {question, research_summary, critique_issues, verdict,
+              confidence_score, critic_score, retry_recommended, revised_question}
+
+    verdict values: "well_supported" | "partially_supported" | "poorly_supported"
+    confidence_score: 0.0 – 1.0 (derived from critic score 1-5)
+    """
+    question = (body.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=422, detail="'question' is required")
+
+    settings = get_settings()
+    model = body.get("model") or settings.model
+    max_tokens = int(body.get("max_tokens") or min(settings.max_tokens, 2048))
+
+    from jarvis.agents.debate import run_debate
+    from jarvis.agents.researcher import ResearcherAgent
+    from jarvis.agents.critic import build_critic
+    from jarvis.tools.registry import build_registry, get_tool_schemas
+
+    schemas = get_tool_schemas()
+    registry = build_registry()
+
+    researcher = ResearcherAgent(
+        model=model,
+        max_tokens=max_tokens,
+        tool_schemas=schemas,
+        tool_registry=registry,
+        max_search_calls=5,
+    )
+    critic = build_critic(model=model, max_tokens=512)
+
+    loop = asyncio.get_running_loop()
+    result_holder: list = []
+
+    def _run():
+        try:
+            result_holder.append(run_debate(question, researcher, critic))
+        except Exception as exc:
+            result_holder.append(exc)
+
+    await loop.run_in_executor(_executor, _run)
+    result = result_holder[0] if result_holder else None
+    if isinstance(result, Exception):
+        raise HTTPException(status_code=500, detail=str(result))
+    return result or {}
 
 
 # ── Agent pipeline ────────────────────────────────────────────────────────────
@@ -2971,6 +4199,9 @@ async def export_session(session_id: str, _user=Depends(_auth_dep)) -> dict:
             "fork_of": row["fork_of"],
             "exported_at": time.time(),
         }
+    from jarvis.memory.turns import get_session_cost
+    db_path = get_settings().reports_dir / "jarvis.db"
+    from jarvis.memory.notes import list_notes
     agent = session.get("agent")
     return {
         "session_id": session_id,
@@ -2978,6 +4209,8 @@ async def export_session(session_id: str, _user=Depends(_auth_dep)) -> dict:
         "user_id": session.get("user_id"),
         "messages": session.get("messages", []),
         "fork_of": session.get("fork_of"),
+        "cost_summary": get_session_cost(db_path, session_id)["totals"],
+        "notes": list_notes(db_path, session_id),
         "exported_at": time.time(),
     }
 
@@ -3025,6 +4258,223 @@ async def import_session(bundle: dict, _user=Depends(_auth_dep)) -> dict:
         "message_count": len(messages),
         "imported_at": time.time(),
     }
+
+
+# ── Session activity timeline ────────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/activity")
+async def get_session_activity(
+    session_id: str,
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Return a merged chronological activity timeline for a session.
+
+    Combines: messages (user/assistant turns), tool calls, checkpoints, notes, tags.
+    Each item: {timestamp, type, summary, detail?}
+
+    type values: "message" | "tool_call" | "checkpoint" | "note" | "tag"
+    """
+    from jarvis.memory.activity import get_activity
+    from jarvis.memory.sessions import load_sessions
+
+    db_path = get_settings().reports_dir / "jarvis.db"
+
+    # Resolve messages: in-memory first, then persisted
+    session = _sessions.get(session_id)
+    if session is not None:
+        messages = list(session.get("messages", []))
+    else:
+        rows = load_sessions(db_path, ttl_minutes=99999)
+        row = next((r for r in rows if r["session_id"] == session_id), None)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+        messages = row["messages"]
+
+    return get_activity(db_path, session_id, messages=messages)
+
+
+# ── Session summarizer ────────────────────────────────────────────────────────
+
+@app.post("/api/sessions/{session_id}/summarize", status_code=200)
+async def summarize_session_endpoint(
+    session_id: str,
+    body: dict = {},
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Summarize a session's conversation history.
+
+    Body (optional):
+      model (str) — Ollama model to use; omit for fast heuristic mode
+
+    Returns: {summary, key_topics, action_items, message_count}
+    """
+    from jarvis.agents.summarize import summarize_session
+    from jarvis.memory.sessions import load_sessions
+
+    session = _sessions.get(session_id)
+    if session is not None:
+        messages = list(session.get("messages", []))
+    else:
+        rows = load_sessions(get_settings().reports_dir / "jarvis.db", ttl_minutes=99999)
+        row = next((r for r in rows if r["session_id"] == session_id), None)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+        messages = row["messages"]
+
+    model = str(body.get("model") or "")
+    loop = asyncio.get_running_loop()
+    result_holder: list = []
+
+    def _run():
+        result_holder.append(summarize_session(messages, model=model))
+
+    await loop.run_in_executor(_executor, _run)
+    s = result_holder[0]
+    return {
+        "summary": s.summary,
+        "key_topics": s.key_topics,
+        "action_items": s.action_items,
+        "message_count": s.message_count,
+    }
+
+
+# ── Session replay ───────────────────────────────────────────────────────────
+
+@app.post("/api/sessions/{session_id}/replay", status_code=200)
+async def replay_session_endpoint(
+    session_id: str,
+    body: dict = {},
+    _user=Depends(_auth_dep),
+) -> list[dict]:
+    """Replay all user turns from a saved session through the current agent config.
+
+    Returns per-turn diffs: [{turn_index, user_message, original_response,
+    replayed_response, changed}]
+
+    Body (optional):
+      dry_run (bool, default false) — skip real model calls, return "<stub>" responses
+      model   (str)                 — override model for replay
+    """
+    from jarvis.agents.replay import replay_session
+    from jarvis.memory.sessions import load_sessions
+
+    dry_run = bool(body.get("dry_run", False))
+    db_path = get_settings().reports_dir / "jarvis.db"
+
+    # Resolve messages: in-memory first, then persisted
+    session = _sessions.get(session_id)
+    if session is not None:
+        messages = list(session.get("messages", []))
+    else:
+        rows = load_sessions(db_path, ttl_minutes=99999)
+        row = next((r for r in rows if r["session_id"] == session_id), None)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+        messages = row["messages"]
+
+    if not messages:
+        return []
+
+    if dry_run:
+        turns = replay_session(messages, run_turn_fn=lambda m: ("<stub>", m), dry_run=True)
+        return [
+            {
+                "turn_index": t.turn_index,
+                "user_message": t.user_message,
+                "original_response": t.original_response,
+                "replayed_response": t.replayed_response,
+                "changed": t.changed,
+            }
+            for t in turns
+        ]
+
+    # Real replay: build a fresh agent then run each turn in a thread
+    model = body.get("model") or get_settings().model
+    replay_session_id = str(uuid.uuid4())
+    tmp_session = _get_session(replay_session_id, researcher_mode=False)
+    agent = tmp_session["agent"]
+
+    def _run_turn(ctx: list[dict]) -> tuple[str, list[dict]]:
+        return agent.run_turn(ctx)
+
+    loop = asyncio.get_running_loop()
+    result_holder: list = []
+
+    def _run():
+        try:
+            result_holder.append(replay_session(messages, _run_turn))
+        except Exception as exc:
+            result_holder.append(exc)
+
+    await loop.run_in_executor(_executor, _run)
+    raw = result_holder[0] if result_holder else []
+    if isinstance(raw, Exception):
+        raise HTTPException(status_code=500, detail=str(raw))
+
+    return [
+        {
+            "turn_index": t.turn_index,
+            "user_message": t.user_message,
+            "original_response": t.original_response,
+            "replayed_response": t.replayed_response,
+            "changed": t.changed,
+        }
+        for t in raw
+    ]
+
+
+# ── Markdown session export ───────────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/export/markdown")
+async def export_session_markdown(
+    session_id: str,
+    _user=Depends(_auth_dep),
+) -> Response:
+    """Export a session as a Markdown document.
+
+    Returns text/markdown content with conversation formatted as headings,
+    tool calls in fenced code blocks, and a metadata footer.
+    """
+    from jarvis.tools.markdown_export import session_to_markdown
+    from jarvis.memory.sessions import load_sessions, get_metadata
+
+    session = _sessions.get(session_id)
+    if session is not None:
+        messages = list(session.get("messages", []))
+        title = session.get("title", "")
+    else:
+        db_path = get_settings().reports_dir / "jarvis.db"
+        rows = load_sessions(db_path, ttl_minutes=99999)
+        row = next((r for r in rows if r["session_id"] == session_id), None)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+        messages = row["messages"]
+        meta = get_metadata(db_path, session_id)
+        title = (meta or {}).get("title") or ""
+
+    md = session_to_markdown(messages, session_id=session_id, title=title or "")
+    filename = f"session-{session_id[:8]}.md"
+    return Response(
+        content=md,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ── Session cost breakdown ────────────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/cost")
+async def get_session_cost_breakdown(
+    session_id: str,
+    _user=Depends(_auth_dep),
+) -> dict:
+    """Return per-turn token usage and estimated USD cost for a session."""
+    from jarvis.memory.turns import get_session_cost
+    db_path = get_settings().reports_dir / "jarvis.db"
+    data = get_session_cost(db_path, session_id)
+    if not data["turns"] and session_id not in _sessions:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    return data
 
 
 # ── Session history ────────────────────────────────────────────────────────────

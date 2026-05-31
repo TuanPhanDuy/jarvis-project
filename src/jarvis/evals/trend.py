@@ -109,6 +109,53 @@ def get_trend(db_path: Path, last_n: int = 10) -> list[dict]:
         return []
 
 
+def compare_runs(db_path: Path, run_a_id: str, run_b_id: str) -> dict | None:
+    """Compare two eval runs and return a structured diff.
+
+    Returns:
+        {run_a, run_b, delta_pass_rate,
+         improved: [case_ids], regressed: [case_ids],
+         unchanged_pass: N, unchanged_fail: N}
+
+    Returns None if either run is not found.
+    """
+    run_a = get_run(db_path, run_a_id)
+    run_b = get_run(db_path, run_b_id)
+    if run_a is None or run_b is None:
+        return None
+
+    # Build pass/fail maps by case_id
+    def _pass_map(results: list[dict]) -> dict[str, bool]:
+        return {r["case_id"]: bool(r.get("overall_pass", False)) for r in results}
+
+    map_a = _pass_map(run_a.get("results", []))
+    map_b = _pass_map(run_b.get("results", []))
+    all_cases = set(map_a) | set(map_b)
+
+    improved, regressed, unchanged_pass, unchanged_fail = [], [], 0, 0
+    for case_id in sorted(all_cases):
+        a_pass = map_a.get(case_id, False)
+        b_pass = map_b.get(case_id, False)
+        if not a_pass and b_pass:
+            improved.append(case_id)
+        elif a_pass and not b_pass:
+            regressed.append(case_id)
+        elif a_pass and b_pass:
+            unchanged_pass += 1
+        else:
+            unchanged_fail += 1
+
+    return {
+        "run_a": {k: v for k, v in run_a.items() if k != "results"},
+        "run_b": {k: v for k, v in run_b.items() if k != "results"},
+        "delta_pass_rate": round(run_b["pass_rate"] - run_a["pass_rate"], 4),
+        "improved": improved,
+        "regressed": regressed,
+        "unchanged_pass": unchanged_pass,
+        "unchanged_fail": unchanged_fail,
+    }
+
+
 def get_run(db_path: Path, run_id: str) -> dict | None:
     """Return full details for a single eval run, including per-case results."""
     if not db_path.exists():

@@ -50,6 +50,8 @@ class BaseAgent(ABC):
         self._prompt_tokens = 0
         self._completion_tokens = 0
         self._turn_tool_calls: list[str] = []
+        self._turn_count = 0
+        self._last_messages: list[dict] = []
         try:
             from jarvis.config import get_settings
             s = get_settings()
@@ -238,7 +240,10 @@ class BaseAgent(ABC):
             span.set_attribute("model", self._model)
             span.set_attribute("messages_count", len(messages))
             result = self._run_turn_inner(messages, on_chunk)
+        self._turn_count += 1
+        self._last_messages = result[1]
         self._log_turn((time.perf_counter() - t0) * 1000)
+        self._maybe_checkpoint(result[1])
         return result
 
     def _log_turn(self, latency_ms: float) -> None:
@@ -256,6 +261,27 @@ class BaseAgent(ABC):
                 tool_calls=self._turn_tool_calls,
                 latency_ms=latency_ms,
             )
+        except Exception:
+            pass
+
+    def _maybe_checkpoint(self, messages: list[dict]) -> None:
+        """Save a checkpoint every N turns when checkpointing is configured."""
+        if not self._session_id:
+            return
+        try:
+            from jarvis.config import get_settings
+            interval = get_settings().checkpoint_interval
+            if not isinstance(interval, int):
+                interval = 0
+        except Exception:
+            interval = 0
+        if interval <= 0 or self._turn_count % interval != 0:
+            return
+        try:
+            from jarvis.agents.checkpoint import save_checkpoint
+            from jarvis.config import get_settings
+            db_path = get_settings().reports_dir / "jarvis.db"
+            save_checkpoint(db_path, self._session_id, self._turn_count, type(self).__name__, messages)
         except Exception:
             pass
 
@@ -441,6 +467,17 @@ class BaseAgent(ABC):
         if handler is None:
             return f"ERROR: unknown tool '{name}'"
 
+        # Quota check — enforce per-user tool call limits
+        try:
+            from jarvis.config import get_settings as _gs
+            from jarvis.tools.quotas import check_quota, QuotaExceededError
+            _qdb = _gs().reports_dir / "jarvis.db"
+            check_quota(_qdb, self._user_id or "anonymous", name)
+        except Exception as _qe:
+            from jarvis.tools.quotas import QuotaExceededError
+            if isinstance(_qe, QuotaExceededError):
+                return f"ERROR: {_qe}"
+
         # Circuit breaker — skip call if service is known-failing
         breaker = None
         try:
@@ -467,23 +504,46 @@ class BaseAgent(ABC):
 
         tracer = get_tracer()
         t0 = time.perf_counter()
+        retry_count = 0
         with tracer.start_as_current_span(f"tool.{name}") as span:
             span.set_attribute("tool.name", name)
             try:
                 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _Timeout
-                tool_timeout = self._tool_timeout_seconds()
-                with ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(handler, tool_input)
-                    result = future.result(timeout=tool_timeout)
+                from jarvis.tools.retry import call_with_retry
+                # Per-tool config overrides global settings
+                _global_timeout = self._tool_timeout_seconds()
+                _global_retries = self._tool_retry_max()
+                try:
+                    from jarvis.tools.tool_config import get_tool_timeout, get_tool_max_retries
+                    from jarvis.config import get_settings as _gcfg
+                    _cfg_db = _gcfg().reports_dir / "jarvis.db"
+                    tool_timeout = get_tool_timeout(_cfg_db, name, _global_timeout)
+                    max_retries = get_tool_max_retries(_cfg_db, name, _global_retries)
+                except Exception:
+                    tool_timeout = _global_timeout
+                    max_retries = _global_retries
+                base_delay = self._tool_retry_base_delay()
+
+                def _timed_call(tool_input: dict) -> str:
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        future = pool.submit(handler, tool_input)
+                        try:
+                            return future.result(timeout=tool_timeout)
+                        except _Timeout:
+                            return f"ERROR: tool '{name}' timed out after {tool_timeout}s"
+
+                result, attempts = call_with_retry(
+                    _timed_call, tool_input,
+                    max_retries=max_retries, base_delay=base_delay,
+                )
+                retry_count = attempts - 1
             except Exception as exc:
-                from concurrent.futures import TimeoutError as _Timeout
-                if isinstance(exc, _Timeout):
-                    result = f"ERROR: tool '{name}' timed out after {self._tool_timeout_seconds()}s"
-                else:
-                    result = f"ERROR: tool '{name}' raised — {exc}"
+                result = f"ERROR: tool '{name}' raised — {exc}"
 
             duration_ms = (time.perf_counter() - t0) * 1000
             result_ok = not str(result).startswith("ERROR")
+            if retry_count > 0:
+                span.set_attribute("tool.retries", retry_count)
 
             if breaker:
                 if result_ok:
@@ -502,6 +562,13 @@ class BaseAgent(ABC):
                         set_cached(db_path, name, tool_input, result)
                 except Exception:
                     pass
+                # Record call for quota tracking
+                try:
+                    from jarvis.tools.quotas import record_call
+                    if db_path:
+                        record_call(db_path, self._user_id or "anonymous", name)
+                except Exception:
+                    pass
 
             self._record_tool_metric(name, duration_ms / 1000)
             self._write_audit(name, tool_input, int(result_ok), duration_ms)
@@ -513,6 +580,20 @@ class BaseAgent(ABC):
             return get_settings().tool_timeout_seconds
         except Exception:
             return 60
+
+    def _tool_retry_max(self) -> int:
+        try:
+            from jarvis.config import get_settings
+            return get_settings().tool_max_retries
+        except Exception:
+            return 2
+
+    def _tool_retry_base_delay(self) -> float:
+        try:
+            from jarvis.config import get_settings
+            return get_settings().tool_retry_base_delay
+        except Exception:
+            return 1.0
 
     def _record_tool_metric(self, name: str, duration_s: float) -> None:
         try:
