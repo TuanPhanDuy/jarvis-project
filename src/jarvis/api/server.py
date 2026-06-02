@@ -91,7 +91,7 @@ log = structlog.get_logger()
 # ── Session store ─────────────────────────────────────────────────────────────
 # Maps session_id → {"agent": agent, "messages": list[dict], "created_at": float}
 _sessions: dict[str, dict] = {}
-_executor = ThreadPoolExecutor(max_workers=4)
+_executor = ThreadPoolExecutor(max_workers=2)
 
 # Active WebSocket connections for proactive push: session_id → WebSocket
 _active_websockets: dict[str, "WebSocket"] = {}

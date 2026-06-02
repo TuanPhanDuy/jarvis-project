@@ -18,7 +18,7 @@ from jarvis.events.types import JarvisEvent, SystemEvent, UserEvent, ExternalEve
 
 log = structlog.get_logger()
 
-_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="jarvis-autonomous")
+_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="jarvis-autonomous")
 
 
 def _compose_prompt(event: JarvisEvent) -> str | None:

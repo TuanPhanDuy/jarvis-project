@@ -437,7 +437,7 @@ def _add_builtin_jobs(scheduler, db_path: Path, reports_dir: Path) -> None:
         (
             "builtin_system_snapshot",
             _system_snapshot_job,
-            CronTrigger(hour="*/6", minute=0, timezone="UTC"),
+            CronTrigger(hour=4, minute=0, timezone="UTC"),
             [str(db_path)],
         ),
         (
@@ -523,11 +523,13 @@ def start_scheduler(db_path: Path):
     global _scheduler
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+    from apscheduler.executors.pool import ThreadPoolExecutor as ApsThreadPool
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     reports_dir = db_path.parent
     jobstores = {"default": SQLAlchemyJobStore(url=f"sqlite:///{db_path}")}
-    _scheduler = BackgroundScheduler(jobstores=jobstores, timezone="UTC")
+    executors = {"default": ApsThreadPool(max_workers=2)}
+    _scheduler = BackgroundScheduler(jobstores=jobstores, executors=executors, timezone="UTC")
     _scheduler.start()
     _add_builtin_jobs(_scheduler, db_path, reports_dir)
     job_count = len(_scheduler.get_jobs())

@@ -28,7 +28,7 @@ class SystemMonitor:
     CPU_THRESHOLD = 90.0
     MEM_THRESHOLD = 85.0
     DISK_FREE_THRESHOLD = 10.0
-    INTERVAL = 60
+    INTERVAL = 120
 
     ALERT_COOLDOWN = 300  # seconds between repeat alerts for the same metric
 
@@ -135,7 +135,7 @@ class FileWatcher:
     Uses polling (watchdog is optional) — checks every 30 s.
     """
 
-    INTERVAL = 30
+    INTERVAL = 120
 
     def __init__(self, bus: EventBus, watch_dir: Path) -> None:
         self._bus = bus
