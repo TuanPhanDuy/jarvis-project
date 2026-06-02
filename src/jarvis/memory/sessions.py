@@ -161,6 +161,26 @@ def get_session_history(
         return []
 
 
+def get_session_messages(db_path: Path, session_id: str) -> list[dict]:
+    """Return all messages for a session in chronological order (oldest first)."""
+    if not db_path.exists():
+        return []
+    try:
+        conn = _conn(db_path)
+        try:
+            row = conn.execute(
+                "SELECT messages FROM persisted_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return []
+        return json.loads(row["messages"])
+    except Exception:
+        return []
+
+
 def delete_persisted_session(db_path: Path, session_id: str) -> bool:
     """Remove a persisted session. Returns True if it existed."""
     try:
@@ -352,6 +372,77 @@ def index_session(db_path: Path, session_id: str, messages: list[dict]) -> None:
             conn.close()
     except Exception:
         pass
+
+
+def search_messages(
+    db_path: Path,
+    query: str,
+    session_id: str | None = None,
+    role: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Search within session message content at the individual message level.
+
+    When session_id is given, scans only that session's messages.
+    Otherwise uses FTS5 to find candidate sessions, then locates matching messages.
+
+    Returns [{session_id, message_idx, role, content, snippet}] ranked by relevance.
+    """
+    if not query.strip():
+        return []
+
+    q_lower = query.lower()
+
+    def _scan_messages(sid: str, messages: list[dict]) -> list[dict]:
+        hits = []
+        for idx, msg in enumerate(messages):
+            if role and msg.get("role") != role:
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+                )
+            content_str = str(content)
+            if q_lower in content_str.lower():
+                # Build a short snippet around the match
+                pos = content_str.lower().find(q_lower)
+                start = max(0, pos - 60)
+                end = min(len(content_str), pos + len(query) + 60)
+                snippet = ("…" if start > 0 else "") + content_str[start:end] + ("…" if end < len(content_str) else "")
+                hits.append({
+                    "session_id": sid,
+                    "message_idx": idx,
+                    "role": msg.get("role", ""),
+                    "content": content_str[:500],
+                    "snippet": snippet,
+                })
+        return hits
+
+    results: list[dict] = []
+
+    if session_id:
+        msgs = get_session_messages(db_path, session_id)
+        results = _scan_messages(session_id, msgs)
+    else:
+        # Use FTS5 to find candidate sessions, then scan their messages
+        try:
+            conn = _conn(db_path)
+            try:
+                candidate_rows = conn.execute(
+                    "SELECT session_id FROM session_fts WHERE content MATCH ? ORDER BY rank LIMIT 20",
+                    (query,),
+                ).fetchall()
+            finally:
+                conn.close()
+            for row in candidate_rows:
+                sid = row["session_id"]
+                msgs = get_session_messages(db_path, sid)
+                results.extend(_scan_messages(sid, msgs))
+        except Exception:
+            pass
+
+    return results[:limit]
 
 
 def search_sessions(db_path: Path, query: str, tag: str | None = None) -> list[dict]:

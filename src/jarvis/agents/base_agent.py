@@ -39,6 +39,7 @@ class BaseAgent(ABC):
         approval_gate=None,
         session_id: str = "",
         user_id: str | None = None,
+        on_tool_call: Callable[[str, bool], None] | None = None,
     ) -> None:
         self._model = model
         self._max_tokens = max_tokens
@@ -47,6 +48,7 @@ class BaseAgent(ABC):
         self._approval_gate = approval_gate
         self._session_id = session_id
         self._user_id = user_id
+        self._on_tool_call = on_tool_call
         self._prompt_tokens = 0
         self._completion_tokens = 0
         self._turn_tool_calls: list[str] = []
@@ -263,6 +265,15 @@ class BaseAgent(ABC):
             )
         except Exception:
             pass
+        if self._session_id:
+            try:
+                from jarvis.memory.context_usage import record_usage
+                from jarvis.config import get_settings
+                db_path = get_settings().reports_dir / "jarvis.db"
+                record_usage(db_path, self._session_id, self._turn_count, self._model,
+                             self._prompt_tokens, self._completion_tokens)
+            except Exception:
+                pass
 
     def _maybe_checkpoint(self, messages: list[dict]) -> None:
         """Save a checkpoint every N turns when checkpointing is configured."""
@@ -572,6 +583,11 @@ class BaseAgent(ABC):
 
             self._record_tool_metric(name, duration_ms / 1000)
             self._write_audit(name, tool_input, int(result_ok), duration_ms)
+            if self._on_tool_call:
+                try:
+                    self._on_tool_call(name, result_ok)
+                except Exception:
+                    pass
             return result
 
     def _tool_timeout_seconds(self) -> int:

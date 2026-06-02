@@ -125,6 +125,58 @@ def get_failure_patterns(
         return []
 
 
+def get_failure_heatmap(
+    db_path: Path,
+    tool_name: str | None = None,
+    days: int = 30,
+) -> dict:
+    """Return failure counts bucketed by hour-of-day (0-23) and day-of-week (0-6).
+
+    day-of-week: 0=Monday … 6=Sunday (strftime %w returns 0=Sunday, we remap).
+    Returns:
+      {tool_name?: str, days: int,
+       by_hour: {0: count, ..., 23: count},
+       by_dow:  {0: count, ..., 6: count},   # 0=Monday
+       total: int}
+    """
+    try:
+        cutoff = time.time() - days * 86400
+        conn = _get_conn(db_path)
+        try:
+            if tool_name:
+                rows = conn.execute(
+                    "SELECT timestamp FROM tool_failures WHERE tool_name=? AND timestamp>=?",
+                    (tool_name, cutoff),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT timestamp FROM tool_failures WHERE timestamp>=?", (cutoff,)
+                ).fetchall()
+        finally:
+            conn.close()
+
+        from datetime import datetime, timezone
+        by_hour = {h: 0 for h in range(24)}
+        by_dow = {d: 0 for d in range(7)}
+
+        for r in rows:
+            dt = datetime.fromtimestamp(r["timestamp"], tz=timezone.utc)
+            by_hour[dt.hour] += 1
+            # remap: strftime Sunday=0 → Monday=0
+            dow = (dt.weekday())  # already Mon=0 in Python
+            by_dow[dow] += 1
+
+        return {
+            "tool_name": tool_name,
+            "days": days,
+            "by_hour": by_hour,
+            "by_dow": by_dow,
+            "total": len(rows),
+        }
+    except Exception:
+        return {"tool_name": tool_name, "days": days, "by_hour": {}, "by_dow": {}, "total": 0}
+
+
 def prune_old_failures(db_path: Path, retention_days: int) -> int:
     """Delete failure records older than retention_days. Returns number of rows deleted."""
     cutoff = time.time() - retention_days * 86400

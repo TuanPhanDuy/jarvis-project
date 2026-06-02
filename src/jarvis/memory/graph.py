@@ -303,6 +303,98 @@ def export_graph(
         return {"nodes": [], "edges": []}
 
 
+def export_viz(
+    db_path: Path,
+    user_id: str = "shared",
+    focal_entity: str | None = None,
+    depth: int = 2,
+    limit: int = 300,
+) -> dict:
+    """Export a D3 force-graph compatible visualization payload.
+
+    Returns:
+      {nodes: [{id, label, group, size, description}],
+       links: [{source, target, label, value}],
+       stats: {node_count, edge_count, entity_types}}
+
+    When focal_entity is given, returns the BFS subgraph up to `depth` hops.
+    Node 'group' is the entity type; node 'size' is proportional to degree.
+    Link 'value' is always 1 (use as edge weight in force simulations).
+    """
+    if not db_path.exists():
+        return {"nodes": [], "links": [], "stats": {"node_count": 0, "edge_count": 0, "entity_types": {}}}
+
+    try:
+        conn = _get_conn(db_path)
+        try:
+            if focal_entity:
+                subgraph = _bfs_subgraph(conn, focal_entity, depth, user_id)
+                entity_names = set(subgraph["entities"])
+                entity_rows = conn.execute(
+                    f"SELECT name, type, description FROM entities WHERE name IN ({','.join('?'*len(entity_names))}) AND user_id IN (?, 'shared')",
+                    (*entity_names, user_id),
+                ).fetchall() if entity_names else []
+                rel_rows = [
+                    {"from_entity": s, "relation": r, "to_entity": t, "notes": ""}
+                    for s, r, t in subgraph["edges"]
+                    if s in entity_names and t in entity_names
+                ]
+            else:
+                entity_rows = conn.execute(
+                    "SELECT name, type, description FROM entities WHERE user_id IN (?, 'shared') ORDER BY created_at DESC LIMIT ?",
+                    (user_id, limit),
+                ).fetchall()
+                node_names = {r["name"] for r in entity_rows}
+                rel_rows = conn.execute(
+                    "SELECT from_entity, relation, to_entity, notes FROM relationships WHERE user_id IN (?, 'shared')",
+                    (user_id,),
+                ).fetchall()
+                rel_rows = [dict(r) for r in rel_rows if r["from_entity"] in node_names and r["to_entity"] in node_names]
+        finally:
+            conn.close()
+
+        # Compute degree for node size
+        degree: dict[str, int] = {}
+        for r in rel_rows:
+            fe = r["from_entity"] if isinstance(r, dict) else r[0]
+            te = r["to_entity"] if isinstance(r, dict) else r[2]
+            degree[fe] = degree.get(fe, 0) + 1
+            degree[te] = degree.get(te, 0) + 1
+
+        entity_types: dict[str, int] = {}
+        nodes = []
+        for r in entity_rows:
+            etype = r["type"] or "unknown"
+            entity_types[etype] = entity_types.get(etype, 0) + 1
+            nodes.append({
+                "id": r["name"],
+                "label": r["name"],
+                "group": etype,
+                "size": max(5, min(30, 5 + degree.get(r["name"], 0) * 2)),
+                "description": (r["description"] or "")[:200],
+            })
+
+        links = []
+        for r in rel_rows:
+            if isinstance(r, dict):
+                src, rel, tgt = r["from_entity"], r["relation"], r["to_entity"]
+            else:
+                src, rel, tgt = r[0], r[1], r[2]
+            links.append({"source": src, "target": tgt, "label": rel, "value": 1})
+
+        return {
+            "nodes": nodes,
+            "links": links,
+            "stats": {
+                "node_count": len(nodes),
+                "edge_count": len(links),
+                "entity_types": entity_types,
+            },
+        }
+    except Exception:
+        return {"nodes": [], "links": [], "stats": {"node_count": 0, "edge_count": 0, "entity_types": {}}}
+
+
 def delete_entity(db_path: Path, name: str, user_id: str = "shared") -> bool:
     """Delete an entity and its relationships by name+user_id. Returns True if found."""
     if not db_path.exists():

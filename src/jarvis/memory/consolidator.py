@@ -163,7 +163,69 @@ def consolidate_user_memory(
 
     count = len(best)
     log.info("consolidation_complete", user_id=user_id, preferences_found=count)
+    try:
+        record_consolidation_run(db_path, user_id, count, lookback_hours, started_at=cutoff + lookback_hours * 3600)
+    except Exception:
+        pass
     return count
+
+
+def _runs_conn(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS consolidation_runs (
+            id              TEXT PRIMARY KEY,
+            user_id         TEXT NOT NULL,
+            preferences_found INTEGER NOT NULL DEFAULT 0,
+            lookback_hours  INTEGER NOT NULL DEFAULT 24,
+            status          TEXT NOT NULL DEFAULT 'done',
+            error           TEXT,
+            started_at      REAL NOT NULL,
+            finished_at     REAL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cr_user ON consolidation_runs(user_id, started_at DESC)")
+    conn.commit()
+    return conn
+
+
+def record_consolidation_run(
+    db_path: Path,
+    user_id: str,
+    preferences_found: int,
+    lookback_hours: int,
+    started_at: float,
+    error: str | None = None,
+) -> None:
+    import uuid as _uuid
+    conn = _runs_conn(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO consolidation_runs (id, user_id, preferences_found, lookback_hours, status, error, started_at, finished_at) VALUES (?,?,?,?,?,?,?,?)",
+            (str(_uuid.uuid4()), user_id, preferences_found, lookback_hours,
+             "failed" if error else "done", error, started_at, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_consolidation_history(db_path: Path, user_id: str, limit: int = 20) -> list[dict]:
+    """Return past consolidation runs for a user, newest first."""
+    try:
+        conn = _runs_conn(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT * FROM consolidation_runs WHERE user_id=? ORDER BY started_at DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 
 def get_all_user_ids(db_path: Path) -> list[str]:

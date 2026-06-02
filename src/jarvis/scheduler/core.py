@@ -586,11 +586,55 @@ def _eval_run_job(
         log.error("scheduled_eval_failed", error=str(exc))
 
 
+def _watchlist_check_job(db_path_str: str) -> None:
+    """Scheduled job: check all enabled watchlist entries and fire notifications for new hits."""
+    try:
+        from pathlib import Path as _Path
+        from jarvis.memory.watchlist import list_watches, check_watch
+
+        db_path = _Path(db_path_str)
+        watches = list_watches(db_path)
+        total_new = 0
+        for w in watches:
+            if not w["enabled"]:
+                continue
+            new_hits = check_watch(db_path, w["id"])
+            if new_hits:
+                total_new += len(new_hits)
+                try:
+                    from jarvis.events.notifications import push_notification
+                    titles = ", ".join(h["title"] or h["url"] for h in new_hits[:3])
+                    push_notification(
+                        db_path,
+                        event="watchlist_hit",
+                        title=f"Watchlist: {w['topic']}",
+                        body=f"{len(new_hits)} new result(s): {titles}",
+                    )
+                except Exception:
+                    pass
+        log.info("watchlist_check_done", total_new=total_new, watches=len(watches))
+    except Exception as exc:
+        log.error("watchlist_check_failed", error=str(exc))
+
+
+def _research_digest_job(db_path_str: str, hours: int = 24) -> None:
+    """Scheduled job: generate and persist a structured research digest."""
+    try:
+        from pathlib import Path as _Path
+        from jarvis.memory.digest import generate_digest
+        result = generate_digest(_Path(db_path_str), hours=hours, use_claude=True)
+        log.info("research_digest_generated", digest_id=result["id"])
+    except Exception as exc:
+        log.error("research_digest_failed", error=str(exc))
+
+
 JOB_FUNCTIONS = {
     "research": _research_job,
     "monitor": _monitor_job,
     "memory_consolidate": _memory_consolidation_job,
     "digest": _digest_job,
+    "research_digest": _research_digest_job,
+    "watchlist_check": _watchlist_check_job,
     "feedback_analyze": _feedback_analyze_job,
     "system_snapshot": _system_snapshot_job,
     "analyze": _analyze_job,

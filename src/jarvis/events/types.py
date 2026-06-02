@@ -78,3 +78,20 @@ class ExternalEvent(JarvisEvent):
 
     def __post_init__(self):
         self.event_type = "external_event"
+
+
+@dataclass
+class JobProgressEvent(JarvisEvent):
+    """Fired during async job execution to report incremental progress."""
+    job_id: str = ""
+    sub_type: str = ""   # "started" | "tool_call" | "done" | "failed"
+    tool_name: str = ""
+    message: str = ""
+
+    def __post_init__(self):
+        self.event_type = "job_progress"
+
+    def to_dict(self) -> dict:
+        d = super().to_dict()
+        d.update(job_id=self.job_id, sub_type=self.sub_type, tool_name=self.tool_name, message=self.message)
+        return d

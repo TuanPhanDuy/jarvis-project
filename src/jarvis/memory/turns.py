@@ -140,6 +140,81 @@ def get_session_cost(db_path: Path, session_id: str) -> dict:
         return {"session_id": session_id, "turns": [], "totals": {}}
 
 
+def get_agent_stats(
+    db_path: Path,
+    agent_type: str | None = None,
+    days: int = 30,
+) -> dict | list[dict]:
+    """Return performance analytics per agent type (or all if agent_type is None).
+
+    Metrics per agent type:
+      turn_count, total_input_tokens, total_output_tokens, total_cost_usd,
+      avg_latency_ms, p50_latency_ms, p95_latency_ms,
+      top_tools: [(name, count)], daily_counts: [{date, turns}]
+    """
+    try:
+        cutoff = time.time() - days * 86400
+        conn = _get_conn(db_path)
+        try:
+            if agent_type:
+                rows = conn.execute(
+                    "SELECT * FROM agent_turns WHERE agent_type=? AND timestamp>=? ORDER BY timestamp ASC",
+                    (agent_type, cutoff),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM agent_turns WHERE timestamp>=? ORDER BY timestamp ASC",
+                    (cutoff,),
+                ).fetchall()
+        finally:
+            conn.close()
+
+        from collections import defaultdict
+        import statistics
+        from datetime import datetime, timezone
+
+        by_type: dict[str, list] = defaultdict(list)
+        for r in rows:
+            by_type[r["agent_type"]].append(dict(r))
+
+        def _summarise(atype: str, turns: list[dict]) -> dict:
+            latencies = [t["latency_ms"] for t in turns if t["latency_ms"] > 0]
+            total_input = sum(t["input_tokens"] for t in turns)
+            total_output = sum(t["output_tokens"] for t in turns)
+            total_cost = sum(_cost_usd(t["model"], t["input_tokens"], t["output_tokens"]) for t in turns)
+
+            tool_counter: dict[str, int] = defaultdict(int)
+            daily: dict[str, int] = defaultdict(int)
+            for t in turns:
+                for tool in json.loads(t.get("tool_calls_json") or "[]"):
+                    tool_counter[tool] += 1
+                day = datetime.fromtimestamp(t["timestamp"], tz=timezone.utc).strftime("%Y-%m-%d")
+                daily[day] += 1
+
+            return {
+                "agent_type": atype,
+                "turn_count": len(turns),
+                "total_input_tokens": total_input,
+                "total_output_tokens": total_output,
+                "total_cost_usd": round(total_cost, 6),
+                "avg_latency_ms": round(statistics.mean(latencies), 1) if latencies else 0.0,
+                "p50_latency_ms": round(statistics.median(latencies), 1) if latencies else 0.0,
+                "p95_latency_ms": round(sorted(latencies)[int(len(latencies) * 0.95)], 1) if len(latencies) >= 2 else (latencies[0] if latencies else 0.0),
+                "top_tools": sorted(tool_counter.items(), key=lambda x: -x[1])[:10],
+                "daily_counts": [{"date": d, "turns": c} for d, c in sorted(daily.items())],
+            }
+
+        if agent_type:
+            turns = by_type.get(agent_type, [])
+            return _summarise(agent_type, turns)
+
+        return [_summarise(atype, turns) for atype, turns in sorted(by_type.items())]
+    except Exception:
+        if agent_type:
+            return {"agent_type": agent_type, "turn_count": 0, "error": "no data"}
+        return []
+
+
 def get_turn_stats(
     db_path: Path,
     session_id: str | None = None,

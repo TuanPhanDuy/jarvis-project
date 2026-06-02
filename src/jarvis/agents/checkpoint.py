@@ -99,6 +99,48 @@ def load_checkpoint(db_path: Path, checkpoint_id: str) -> dict | None:
         return None
 
 
+def diff_checkpoints(db_path: Path, checkpoint_a: str, checkpoint_b: str) -> dict:
+    """Compare two checkpoints and return a structured delta.
+
+    Returns:
+      {checkpoint_a, checkpoint_b, added: [...], removed: [...], common_count: int}
+
+    Messages are compared by (role, content) identity.  Order is preserved.
+    """
+    cp_a = load_checkpoint(db_path, checkpoint_a)
+    cp_b = load_checkpoint(db_path, checkpoint_b)
+
+    if cp_a is None:
+        raise ValueError(f"Checkpoint '{checkpoint_a}' not found")
+    if cp_b is None:
+        raise ValueError(f"Checkpoint '{checkpoint_b}' not found")
+
+    msgs_a = cp_a["messages"]
+    msgs_b = cp_b["messages"]
+
+    def _key(m: dict) -> str:
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = str(content)
+        return f"{m.get('role', '')}::{content[:200]}"
+
+    set_a = {_key(m) for m in msgs_a}
+    set_b = {_key(m) for m in msgs_b}
+
+    added = [m for m in msgs_b if _key(m) not in set_a]
+    removed = [m for m in msgs_a if _key(m) not in set_b]
+
+    return {
+        "checkpoint_a": {"id": checkpoint_a, "turn_count": cp_a["turn_count"], "created_at": cp_a["created_at"]},
+        "checkpoint_b": {"id": checkpoint_b, "turn_count": cp_b["turn_count"], "created_at": cp_b["created_at"]},
+        "message_count_a": len(msgs_a),
+        "message_count_b": len(msgs_b),
+        "common_count": len(set_a & set_b),
+        "added": added,
+        "removed": removed,
+    }
+
+
 def delete_checkpoints(db_path: Path, session_id: str) -> int:
     """Delete all checkpoints for a session. Returns number of rows deleted."""
     try:

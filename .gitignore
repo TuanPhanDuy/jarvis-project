@@ -29,6 +29,10 @@ uv.lock
 .coverage
 htmlcov/
 *.xml
+# MagicMock filesystem artifacts from pytest (leaked tmp files)
+<MagicMock*
+reports/scheduler.db
+reports/.chroma/
 
 # IDE
 .vscode/
